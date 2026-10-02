@@ -1,0 +1,14 @@
+[package]
+name = "metrics-stream"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "metrics-stream"
+path = "bin/main.rs"
+
+[dependencies]
+microsandbox = { path = "../../../sdk/rust" }
+tokio = { version = "1.52", features = ["full"] }
+futures = "0.3"

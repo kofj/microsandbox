@@ -1,0 +1,89 @@
+---
+title: Volume commands
+sidebarTitle: "Volumes"
+description: Create and manage named volumes from the CLI
+icon: "hard-drive"
+---
+
+Named volumes persist independently of sandboxes. Local volumes default to `~/.microsandbox/volumes/`.
+
+## msb volume create
+
+<Tooltip tip="On microsandbox cloud, create a named volume before mounting it; disk-kind volumes and size are not available, and quota must be a whole number of GiB."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```bash
+msb volume create my-data
+msb volume create --name my-data
+msb volume create docker-data --kind disk --size 10G
+```
+
+| Flag | Description |
+|------|-------------|
+| `-n`, `--name` | Volume name, as an alternative to the positional name |
+| `--kind` | Volume kind (`dir` or `disk`; default `dir`) |
+| `--size` | Disk capacity for `--kind disk` (e.g. `100M`, `1G`, `10G`) |
+| `-q`, `--quiet` | Suppress output (only print the volume name) |
+
+## msb volumes
+
+```bash
+msb volumes
+msb volumes --format json
+msb volumes -q               # Names only
+```
+
+Expanded form: `msb volume ls`. The shorter plural alias `msb vols` is also available.
+
+| Flag | Description |
+|------|-------------|
+| `--format` | Output format (`json`) |
+| `-q`, `--quiet` | Show only volume names |
+
+## msb volume inspect
+
+<Tooltip tip="Not yet available on microsandbox cloud; read volume metadata through the SDK."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```bash
+msb volume inspect my-data
+```
+
+## msb volume rm
+
+```bash
+msb volume rm my-data
+msb volume rm cache-1 cache-2   # Remove multiple
+```
+
+| Flag | Description |
+|------|-------------|
+| `-q`, `--quiet` | Suppress output |
+
+## Using volumes with sandboxes
+
+Use `NAME:GUEST_PATH` to mount a volume. Locally, missing named volumes are created and compatible existing volumes are reused. On cloud, create the volume first.
+
+<Accordion title="Examples">
+
+```bash
+# Create or reuse a directory-backed named volume, then mount it
+msb run --name worker -v app-data:/data python
+
+# Create or reuse a disk-backed named volume, then mount it
+msb run --name docker-demo \
+  --mount-named docker-data:/var/lib/docker:kind=disk,size=20G \
+  docker:dind
+
+# Share between sandboxes
+msb run --name writer -v shared:/data alpine -- sh -c "echo hello > /data/msg.txt"
+msb run --name reader -v shared:/data alpine -- cat /data/msg.txt
+```
+
+</Accordion>
+
+`--mount-named` accepts `kind=dir|disk`, disk `size`, and directory `quota`. Disk mounts require a size. Conflicting settings on an existing volume fail.
+
+Directory and bind mounts accept paired `uid` and `gid` guest-owner fallbacks. These do not change host ownership and cannot combine with `stat-virt=off` or disk mounts.
+
+<Tip>
+  The CLI distinguishes bind mounts from named volumes by looking for a `/` or `.` prefix. `./src:/app` is a bind mount (host path). `myvolume:/data` is a named volume. This matches Docker's convention.
+</Tip>

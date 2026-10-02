@@ -1,0 +1,1137 @@
+---
+title: Agent client
+description: Rust SDK - Low-level agentd client reference
+keywords: ["Rust SDK", "Rust agent client", "microsandbox agent client"]
+---
+
+Low-level typed and raw transport for communicating with `agentd` through a sandbox relay.
+
+## Module functions
+
+#### <span className="msb-recv">agent::</span><span className="msb-hn">connect_sandbox()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_sandbox(name: &str) -> AgentClientResult<AgentClient>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::agent;
+
+let client = agent::connect_sandbox("dev").await?;
+```
+
+</Accordion>
+
+Resolve a sandbox name to its agent relay socket path and connect, using the default ten-second handshake timeout. The socket lives under the SDK's configured runtime directory at a short, name-derived path. Sandbox names are limited to 128 UTF-8 bytes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">agent::</span><span className="msb-hn">connect_sandbox_with_timeout()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_sandbox_with_timeout(name: &str, timeout: Duration) -> AgentClientResult<AgentClient>
+```
+
+<Accordion title="Example">
+
+```rust
+use std::time::Duration;
+use microsandbox::agent;
+
+let client = agent::connect_sandbox_with_timeout("dev", Duration::from_secs(2)).await?;
+```
+
+</Accordion>
+
+Like [`connect_sandbox`](#agentconnect_sandbox), but with an explicit handshake timeout instead of the ten-second default.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>timeout</code><span className="msb-type">Duration</span></div>
+    <div className="msb-param-desc">Maximum time to wait for the relay handshake.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+## AgentClient
+
+<p className="msb-backref">Returned by <a href="#agentconnect_sandbox">agent::connect_sandbox()</a>, <a href="#agentclientconnect">AgentClient::connect()</a> · wrapped by <a href="#agentbridge">AgentBridge</a></p>
+
+Low-level client for raw agent frames.
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">connect()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect(sock_path: impl AsRef<Path>) -> AgentClientResult<AgentClient>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::agent::AgentClient;
+
+let path = AgentClient::socket_path("dev")?;
+let client = AgentClient::connect(&path).await?;
+```
+
+</Accordion>
+
+Connect to an arbitrary agent relay socket by path, using the default ten-second handshake timeout. The connection performs the relay handshake, validates the cached `core.ready` frame, and starts one background reader task.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>sock_path</code><span className="msb-type">impl AsRef&lt;Path&gt;</span></div>
+    <div className="msb-param-desc">Path to the agent relay socket.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">connect_with_timeout()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_with_timeout(sock_path: impl AsRef<Path>, timeout: Duration) -> AgentClientResult<AgentClient>
+```
+
+Connect to an arbitrary agent relay socket by path with an explicit handshake timeout.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>sock_path</code><span className="msb-type">impl AsRef&lt;Path&gt;</span></div>
+    <div className="msb-param-desc">Path to the agent relay socket.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>timeout</code><span className="msb-type">Duration</span></div>
+    <div className="msb-param-desc">Maximum time to wait for the relay handshake.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">connect_with_deadline()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_with_deadline(sock_path: impl AsRef<Path>, deadline: Instant) -> AgentClientResult<AgentClient>
+```
+
+Connect to an arbitrary agent relay socket by path with an explicit handshake deadline. The deadline bounds both handshake reads, so an accepted connection that stalls before writing the handshake bytes cannot block this call indefinitely.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>sock_path</code><span className="msb-type">impl AsRef&lt;Path&gt;</span></div>
+    <div className="msb-param-desc">Path to the agent relay socket.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>deadline</code><span className="msb-type">Instant</span></div>
+    <div className="msb-param-desc">Tokio instant by which the handshake must complete.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">connect_sandbox()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_sandbox(name: &str) -> AgentClientResult<AgentClient>
+```
+
+Resolve a sandbox name to its agent socket path and connect. Equivalent to the module-level [`agent::connect_sandbox`](#agentconnect_sandbox).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">connect_sandbox_with_timeout()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_sandbox_with_timeout(name: &str, timeout: Duration) -> AgentClientResult<AgentClient>
+```
+
+Resolve a sandbox name to its agent socket path and connect with an explicit handshake timeout. Equivalent to the module-level [`agent::connect_sandbox_with_timeout`](#agentconnect_sandbox_with_timeout).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>timeout</code><span className="msb-type">Duration</span></div>
+    <div className="msb-param-desc">Maximum time to wait for the relay handshake.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">AgentClient</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">socket_path()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn socket_path(name: &str) -> MicrosandboxResult<PathBuf>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::agent::AgentClient;
+
+let path = AgentClient::socket_path("dev")?;
+println!("{}", path.display());
+```
+
+</Accordion>
+
+Resolve a sandbox's relay socket path **without connecting**. Returns the same path [`connect_sandbox`](#agentconnect_sandbox) would dial: the hashed path under the runtime directory when it fits the platform's Unix-socket length limit, and the legacy name-derived path otherwise. Useful for talking to `agentd` over a raw byte transport (for example a transparent relay that splices bytes to and from the socket) instead of this frame client. The sandbox need not be running.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">PathBuf</span></div>
+    <div className="msb-param-desc">Relay socket path.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient::</span><span className="msb-hn">ensure_version_compat_for()</span>
+
+```rust
+fn ensure_version_compat_for(t: MessageType, negotiated: u8) -> AgentClientResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::{agent::AgentClient, protocol::message::MessageType};
+
+AgentClient::ensure_version_compat_for(MessageType::FsRequest, 2)?;
+```
+
+</Accordion>
+
+Check a message type against an explicit negotiated generation. The single place the rule lives, exposed for callers that hold the negotiated generation but not a live client. Returns [`AgentClientError::UnsupportedOperation`](#agentclienterror) if the type was introduced after the given generation.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>t</code><span className="msb-type">MessageType</span></div>
+    <div className="msb-param-desc">Protocol message type to gate.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>negotiated</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Protocol generation to check against.</div>
+  </div>
+</div>
+
+<p className="msb-member-group">Instance methods</p>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">request()</span>
+
+```rust
+async fn request<T: Serialize>(&self, t: MessageType, payload: &T) -> AgentClientResult<Message>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::protocol::{
+    fs::{FsOp, FsRequest, FsResponse},
+    message::MessageType,
+};
+
+let response = client
+    .request(
+        MessageType::FsRequest,
+        &FsRequest {
+            op: FsOp::Stat {
+                path: "/etc/os-release".to_string(),
+                follow_symlink: true,
+            },
+        },
+    )
+    .await?;
+let fs_response: FsResponse = response.payload()?;
+```
+
+</Accordion>
+
+Send one typed protocol message and wait for one response frame with the same correlation id. Flags are derived from the message type. Use this for one-shot RPCs such as filesystem stat or list requests. Fails fast with [`AgentClientError::UnsupportedOperation`](#agentclienterror) if the connected sandbox is too old for the message type.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>t</code><span className="msb-type">MessageType</span></div>
+    <div className="msb-param-desc">Protocol message type.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>payload</code><span className="msb-type">&amp;T: Serialize</span></div>
+    <div className="msb-param-desc">Message payload, serialized with CBOR.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Message</span></div>
+    <div className="msb-param-desc">Decoded response message.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">stream()</span>
+
+```rust
+async fn stream<T: Serialize>(&self, t: MessageType, payload: &T) -> AgentClientResult<(u32, Receiver<Message>)>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::protocol::{exec::ExecRequest, message::MessageType};
+
+let (id, mut rx) = client
+    .stream(MessageType::ExecRequest, &ExecRequest {
+        cmd: "echo".into(),
+        args: vec!["hi".into()],
+        env: Vec::new(),
+        cwd: None,
+        user: None,
+        tty: false,
+        rows: 24,
+        cols: 80,
+        rlimits: Vec::new(),
+    })
+    .await?;
+
+while let Some(msg) = rx.recv().await {
+    println!("{:?}", msg.t);
+}
+```
+
+</Accordion>
+
+Open a typed streaming session. The returned id is the protocol correlation id. Use it with [`send()`](#client-send) for follow-up messages such as stdin, resize, signal, or file data chunks. The receiver yields messages until a terminal frame is delivered or the connection closes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>t</code><span className="msb-type">MessageType</span></div>
+    <div className="msb-param-desc">Protocol message type for the opening frame.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>payload</code><span className="msb-type">&amp;T: Serialize</span></div>
+    <div className="msb-param-desc">Opening message payload, serialized with CBOR.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">(u32, Receiver&lt;Message&gt;)</span></div>
+    <div className="msb-param-desc">Correlation id and a typed message receiver.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">send()</span>
+
+```rust
+async fn send<T: Serialize>(&self, id: u32, t: MessageType, payload: &T) -> AgentClientResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::protocol::{exec::ExecStdin, message::MessageType};
+
+client.send(id, MessageType::ExecStdin, &ExecStdin { data: b"input\n".to_vec() }).await?;
+```
+
+</Accordion>
+
+Send a typed follow-up message on an existing correlation id (the id returned by [`stream()`](#client-stream)).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>id</code><span className="msb-type">u32</span></div>
+    <div className="msb-param-desc">Correlation id from the open stream.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>t</code><span className="msb-type">MessageType</span></div>
+    <div className="msb-param-desc">Protocol message type.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>payload</code><span className="msb-type">&amp;T: Serialize</span></div>
+    <div className="msb-param-desc">Message payload, serialized with CBOR.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">request_raw()</span>
+
+```rust
+async fn request_raw(&self, flags: u8, body: Vec<u8>) -> AgentClientResult<RawFrame>
+```
+
+<Accordion title="Example">
+
+```rust
+let frame = client.request_raw(flags, body).await?;
+println!("id={} flags={}", frame.id, frame.flags);
+```
+
+</Accordion>
+
+Allocate a correlation id, send one raw frame with `(flags, body)`, and wait for one raw response frame with the matching id. CBOR encoding and decoding are left to the caller.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Frame flag byte.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Vec&lt;u8&gt;</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#rawframe">RawFrame</a></div>
+    <div className="msb-param-desc">Raw response frame.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">stream_raw()</span>
+
+```rust
+async fn stream_raw(&self, flags: u8, body: Vec<u8>) -> AgentClientResult<(u32, Receiver<RawFrame>)>
+```
+
+Open a raw streaming session. The receiver yields raw frames for the returned correlation id until a frame with the terminal flag arrives or the receiver is dropped. Use [`send_raw()`](#client-send_raw) with the returned id to send follow-up frames.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Frame flag byte for the opening frame.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Vec&lt;u8&gt;</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">(u32, Receiver&lt;RawFrame&gt;)</span></div>
+    <div className="msb-param-desc">Correlation id and a raw frame receiver.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">send_raw()</span>
+
+```rust
+async fn send_raw(&self, id: u32, flags: u8, body: &[u8]) -> AgentClientResult<()>
+```
+
+Send a raw follow-up frame on an existing correlation id (the id returned by [`stream_raw()`](#client-stream_raw)).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>id</code><span className="msb-type">u32</span></div>
+    <div className="msb-param-desc">Correlation id from the open raw stream.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Frame flag byte.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">&amp;[u8]</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">ready()</span>
+
+```rust
+fn ready(&self) -> AgentClientResult<Ready>
+```
+
+<Accordion title="Example">
+
+```rust
+let ready = client.ready()?;
+println!("boot {} ns", ready.boot_time_ns);
+```
+
+</Accordion>
+
+Return the decoded `core.ready` payload captured during the handshake (boot timings and the runtime's self-reported version).
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Ready</span></div>
+    <div className="msb-param-desc">Decoded handshake payload.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">ready_bytes()</span>
+
+```rust
+fn ready_bytes(&self) -> &[u8]
+```
+
+Return the cached handshake `core.ready` frame body as CBOR bytes. Useful for bindings that want to deserialize the ready payload with their own CBOR tooling. For typed access, use [`ready()`](#client-ready).
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">&amp;[u8]</span></div>
+    <div className="msb-param-desc">CBOR-encoded ready frame body.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">protocol()</span>
+
+```rust
+fn protocol(&self) -> AgentProtocol
+```
+
+The agent protocol generation (wire codec) negotiated for this connection.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentprotocol">AgentProtocol</a></div>
+    <div className="msb-param-desc">Codec generation: <code>Current</code> or <code>LegacyV1</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">is_legacy_protocol()</span>
+
+```rust
+fn is_legacy_protocol(&self) -> bool
+```
+
+Whether this connection is using the legacy pre-0.5 protocol.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc"><code>true</code> if the relay speaks the pre-0.5 protocol.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">negotiated_version()</span>
+
+```rust
+fn negotiated_version(&self) -> u8
+```
+
+The negotiated protocol generation for this connection: the lower of what this client speaks and what the sandbox advertised at handshake. This is the capability gate that drives [`supports()`](#client-supports) and the typed send path, and it is distinct from [`protocol()`](#client-protocol), which selects the wire codec.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Negotiated capability generation.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">agent_version()</span>
+
+```rust
+fn agent_version(&self) -> &str
+```
+
+The runtime's self-reported package version, taken from its `core.ready` frame. Empty when the runtime predates this field (an older agent), in which case fall back to the generation for diagnostics.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Runtime package version, or empty if unknown.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">supports()</span>
+
+```rust
+fn supports(&self, t: MessageType) -> bool
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::protocol::message::MessageType;
+
+if client.supports(MessageType::FsRequest) {
+    // safe to issue filesystem RPCs
+}
+```
+
+</Accordion>
+
+Whether the connected sandbox is new enough to handle the given message type. The single source of truth for feature gating: callers that cannot gate by sending (for example the SSH/SFTP layer) consult this instead of inspecting the protocol generation directly.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>t</code><span className="msb-type">MessageType</span></div>
+    <div className="msb-param-desc">Protocol message type to check.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc"><code>true</code> if the runtime can handle the type.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">ensure_version_compat()</span>
+
+```rust
+fn ensure_version_compat(&self, t: MessageType) -> AgentClientResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::protocol::message::MessageType;
+
+client.ensure_version_compat(MessageType::TcpConnect)?;
+```
+
+</Accordion>
+
+Reject a message type the connected sandbox is too old to handle, against this connection's negotiated generation. Fails before any bytes are sent, so only that one operation fails and the session continues. The typed [`request()`](#client-request), [`stream()`](#client-stream), and [`send()`](#client-send) methods call this internally.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>t</code><span className="msb-type">MessageType</span></div>
+    <div className="msb-param-desc">Protocol message type to gate.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">close()</span>
+
+```rust
+async fn close(self)
+```
+
+<Accordion title="Example">
+
+```rust
+client.close().await;
+```
+
+</Accordion>
+
+Close the client by consuming it. Drops the writer and aborts the reader task; any in-flight requests resolve with [`AgentClientError::Closed`](#agentclienterror). Dropping the client has the same effect.
+
+## AgentBridge
+
+FFI-friendly bytes-in/bytes-out wrapper around [`AgentClient`](#agentclient).
+
+#### <span className="msb-recv">AgentBridge::</span><span className="msb-hn">connect_sandbox()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_sandbox(name: &str) -> AgentClientResult<AgentBridge>
+```
+
+Connect to a sandbox by name, resolving the socket path from SDK config. Sandbox names are limited to 128 UTF-8 bytes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentbridge">AgentBridge</a></div>
+    <div className="msb-param-desc">Connected bridge.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentBridge::</span><span className="msb-hn">connect_sandbox_with_timeout()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_sandbox_with_timeout(name: &str, timeout: Duration) -> AgentClientResult<AgentBridge>
+```
+
+Connect to a sandbox by name with an explicit handshake timeout.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>timeout</code><span className="msb-type">Duration</span></div>
+    <div className="msb-param-desc">Maximum time to wait for the relay handshake.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentbridge">AgentBridge</a></div>
+    <div className="msb-param-desc">Connected bridge.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentBridge::</span><span className="msb-hn">connect_path()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_path(path: &str) -> AgentClientResult<AgentBridge>
+```
+
+Connect to an arbitrary agentd relay socket by path.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Path to the agent relay socket.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentbridge">AgentBridge</a></div>
+    <div className="msb-param-desc">Connected bridge.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentBridge::</span><span className="msb-hn">connect_path_with_timeout()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn connect_path_with_timeout(path: &str, timeout: Duration) -> AgentClientResult<AgentBridge>
+```
+
+Connect to an arbitrary agentd relay socket by path with an explicit handshake timeout.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Path to the agent relay socket.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>timeout</code><span className="msb-type">Duration</span></div>
+    <div className="msb-param-desc">Maximum time to wait for the relay handshake.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentbridge">AgentBridge</a></div>
+    <div className="msb-param-desc">Connected bridge.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">request()</span>
+
+```rust
+async fn request(&self, flags: u8, body: Vec<u8>) -> AgentClientResult<BridgeFrame>
+```
+
+One-shot request: send `(flags, body)` and wait for one response frame.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Frame flag byte.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Vec&lt;u8&gt;</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#bridgeframe">BridgeFrame</a></div>
+    <div className="msb-param-desc">Response frame.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">send()</span>
+
+```rust
+async fn send(&self, id: u32, flags: u8, body: Vec<u8>) -> AgentClientResult<()>
+```
+
+Send a follow-up frame on an existing correlation id.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>id</code><span className="msb-type">u32</span></div>
+    <div className="msb-param-desc">Correlation id from an open stream.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Frame flag byte.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Vec&lt;u8&gt;</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">stream_open()</span>
+
+```rust
+async fn stream_open(&self, flags: u8, body: Vec<u8>) -> AgentClientResult<(u32, StreamHandle)>
+```
+
+Open a streaming session. Returns the protocol correlation id (for follow-up sends via [`send()`](#bridge-send)) and an opaque stream handle (for [`stream_next()`](#bridge-stream_next) and [`stream_close()`](#bridge-stream_close)).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">u8</span></div>
+    <div className="msb-param-desc">Frame flag byte for the opening frame.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Vec&lt;u8&gt;</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">(u32, <a className="msb-type" href="#streamhandle">StreamHandle</a>)</span></div>
+    <div className="msb-param-desc">Correlation id and an opaque stream handle.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">stream_next()</span>
+
+```rust
+async fn stream_next(&self, handle: StreamHandle) -> AgentClientResult<Option<BridgeFrame>>
+```
+
+<Accordion title="Example">
+
+```rust
+let (id, handle) = bridge.stream_open(flags, body).await?;
+while let Some(frame) = bridge.stream_next(handle).await? {
+    // decode frame.body with your own CBOR tooling
+}
+```
+
+</Accordion>
+
+Pull the next frame from a stream. Returns `None` when the stream has ended (the terminal frame was already delivered, or the stream was closed or dropped).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>handle</code><a className="msb-type" href="#streamhandle">StreamHandle</a></div>
+    <div className="msb-param-desc">Handle returned by <a href="#bridge-stream_open"><code>stream_open()</code></a>.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;<a className="msb-type" href="#bridgeframe">BridgeFrame</a>&gt;</span></div>
+    <div className="msb-param-desc">Next frame, or <code>None</code> at end of stream.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">stream_close()</span>
+
+```rust
+async fn stream_close(&self, handle: StreamHandle)
+```
+
+Close a stream and drop its handle. Idempotent.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>handle</code><a className="msb-type" href="#streamhandle">StreamHandle</a></div>
+    <div className="msb-param-desc">Handle returned by <a href="#bridge-stream_open"><code>stream_open()</code></a>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">ready_bytes()</span>
+
+```rust
+fn ready_bytes(&self) -> AgentClientResult<Vec<u8>>
+```
+
+The cached handshake `core.ready` frame body bytes (CBOR). Errors with [`AgentClientError::Closed`](#agentclienterror) if the bridge has been closed.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Vec&lt;u8&gt;</span></div>
+    <div className="msb-param-desc">CBOR-encoded ready frame body.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">bridge.</span><span className="msb-hn">close()</span>
+
+```rust
+async fn close(&self)
+```
+
+<Accordion title="Example">
+
+```rust
+bridge.close().await;
+```
+
+</Accordion>
+
+Close the connection. Idempotent. After close, every operation except another close returns [`AgentClientError::Closed`](#agentclienterror).
+
+## Types
+
+### BridgeFrame
+
+<p className="msb-backref">Returned by <a href="#bridge-request">bridge.request()</a>, <a href="#bridge-stream_next">bridge.stream_next()</a></p>
+
+FFI-friendly view of a [`RawFrame`](#rawframe): id, flags, body bytes.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `u32` | Correlation ID from the frame header. |
+| `flags` | `u8` | Frame flags from the frame header. |
+| `body` | `Vec<u8>` | Raw CBOR-encoded body bytes. |
+
+### StreamHandle
+
+<p className="msb-backref">Returned by <a href="#bridge-stream_open">bridge.stream_open()</a> · used by <a href="#bridge-stream_next">bridge.stream_next()</a>, <a href="#bridge-stream_close">bridge.stream_close()</a></p>
+
+```rust
+pub type StreamHandle = u64;
+```
+
+Opaque handle identifying an open stream on an [`AgentBridge`](#agentbridge). Foreign-language wrappers reference streams by this `u64` instead of owning a tokio receiver.
+
+### AgentProtocol
+
+<p className="msb-backref">Returned by <a href="#client-protocol">client.protocol()</a></p>
+
+Agent protocol generation (wire codec) spoken by a connected sandbox relay.
+
+| Variant | Description |
+| --- | --- |
+| `Current` | Current protocol generation. |
+| `LegacyV1` | Pre-0.5 microsandbox relay handshake and agent protocol. |
+
+### RawFrame
+
+<p className="msb-backref">Returned by <a href="#client-request_raw">client.request_raw()</a>, <a href="#client-stream_raw">client.stream_raw()</a></p>
+
+A framed protocol message at the byte level. `id` is the protocol correlation id, `flags` is the frame flag byte, and `body` is the CBOR-encoded protocol message body. Re-exported from `microsandbox::protocol::codec`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `u32` | Protocol correlation id. |
+| `flags` | `u8` | Frame flag byte. |
+| `body` | `Vec<u8>` | CBOR-encoded protocol message body. |
+
+### AgentClientError
+
+<p className="msb-backref">Error variant of <a href="#agentclientresult">AgentClientResult</a></p>
+
+Errors raised by [`AgentClient`](#agentclient) and [`AgentBridge`](#agentbridge).
+
+| Variant | Description |
+| --- | --- |
+| `Connect { path, source }` | Failed to open the Unix socket connection to the relay. |
+| `Handshake(String)` | Handshake with the relay failed (timeout, EOF, or malformed frame). |
+| `SandboxNotFound(String)` | Sandbox name could not be resolved to an agent socket path. |
+| `InvalidSandboxName(String)` | Sandbox name failed SDK validation before socket resolution. |
+| `Io(std::io::Error)` | An I/O error occurred on the socket after connect. |
+| `Protocol(ProtocolError)` | A wire-protocol error (framing, CBOR, oversize frame). |
+| `Cbor(String)` | CBOR encoding or decoding failed. |
+| `InvalidPacket(String)` | The supplied packet did not contain exactly one complete transport frame. |
+| `UnsupportedOperation { msg_type, needs, peer }` | The connected sandbox's runtime is older than the requested feature needs; restart the sandbox to update its runtime. |
+| `ReaderClosed(u32)` | The reader task closed before the in-flight request received its response. |
+| `Closed` | The client has been closed. |
+| `IdRangeExhausted` | The relay-assigned correlation ID range has no available IDs. |
+| `NotImplemented(&'static str)` | The operation is not implemented yet. |
+
+### AgentClientResult
+
+<p className="msb-backref">Returned by most <a href="#agentclient">AgentClient</a> and <a href="#agentbridge">AgentBridge</a> methods</p>
+
+```rust
+pub type AgentClientResult<T> = Result<T, AgentClientError>;
+```
+
+Result alias for agent client operations. The error is [`AgentClientError`](#agentclienterror).

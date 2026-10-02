@@ -1,0 +1,5496 @@
+//! Common sandbox configuration flags shared between commands.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use clap::builder::{PossibleValuesParser, TypedValueParser};
+use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches};
+#[cfg(feature = "net")]
+use microsandbox::OutboundProxy;
+use microsandbox::VolumeKind;
+use microsandbox::backend::{Backend, LocalBackend};
+use microsandbox::sandbox::{
+    CpuPlacement, DeploymentProfile, DiskImageFormat, FlatClone, GuestClockPolicy, MountBuilder,
+    Patch, RootDiskBuilder, Sandbox, SandboxBuilder, SandboxHandle, SecurityProfile,
+    TransparentHugePagePolicy, VolumeMount, VsockSocketType,
+};
+#[cfg(feature = "net")]
+use microsandbox_network::{OutboundProxyBuilder, OutboundProxyConfig};
+#[cfg(feature = "net")]
+use microsandbox_types::NetworkRateLimitDirection;
+
+use crate::ui;
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Backend resolution
+//--------------------------------------------------------------------------------------------------
+
+/// Resolve the process-wide local backend exactly once at the CLI entry point.
+///
+/// CLI commands always operate against the active default backend. Returns
+/// an `Arc<dyn Backend>` plus a borrow of the `LocalBackend` inside it so
+/// callers can dispatch through either the trait or the local-only APIs.
+/// Errors when the resolved default backend isn't a local one (e.g. when
+/// the user has installed a cloud profile but is running a local-only
+/// command).
+pub fn resolve_local_backend() -> anyhow::Result<Arc<dyn Backend>> {
+    let backend = microsandbox::backend::default_backend();
+    if backend.as_local().is_none() {
+        anyhow::bail!(
+            "this command requires a local backend, but the active default is a cloud backend"
+        );
+    }
+    Ok(backend)
+}
+
+/// Display relaxed-restore diagnostics even when ordinary progress is quiet.
+pub(crate) async fn display_restore_warnings(sandbox: &Sandbox) {
+    if !sandbox.config().resumed_from_full_snapshot() {
+        return;
+    }
+    match sandbox.restore_warnings().await {
+        Ok(warnings) => {
+            for warning in warnings {
+                ui::warn(&format!(
+                    "external mount {}: {} (stale inodes: {:?})",
+                    warning.guest_path, warning.reason, warning.stale_inodes,
+                ));
+            }
+        }
+        // Creation already succeeded. Reporting a diagnostic-read failure must not imply
+        // rollback or discard the live handle and accidentally trigger its drop policy.
+        Err(error) => ui::warn(&format!("could not read restore warnings: {error}")),
+    }
+}
+
+/// Borrow the `LocalBackend` inside the resolved default backend, or error.
+pub fn local_backend_ref(backend: &Arc<dyn Backend>) -> anyhow::Result<&LocalBackend> {
+    backend
+        .as_local()
+        .ok_or_else(|| anyhow::anyhow!("this command requires a local backend"))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Sparse configuration files accepted by single-sandbox commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SandboxConfigKind {
+    /// A sparse root sandbox configuration.
+    Root,
+    /// An unwrapped network configuration.
+    Network,
+    /// An unwrapped resource and lifecycle configuration.
+    Resources,
+    /// An unwrapped runtime configuration.
+    Runtime,
+    /// An unwrapped filesystem configuration.
+    Filesystem,
+    /// An unwrapped secret-name map.
+    Secrets,
+    /// An unwrapped script-name map.
+    Scripts,
+}
+
+/// One configuration source in its original command-line position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SandboxConfigSource {
+    /// The schema expected for this source.
+    pub(crate) kind: SandboxConfigKind,
+    /// The file to load.
+    pub(crate) path: PathBuf,
+}
+
+/// Sparse configuration files accepted by single-sandbox commands.
+#[derive(Debug, Default)]
+pub struct SandboxConfigSources {
+    /// Sources sorted by their occurrence on the command line.
+    sources: Vec<SandboxConfigSource>,
+}
+
+/// Common sandbox configuration flags shared between `msb run` and `msb create`.
+#[derive(Debug, Default, Args)]
+pub struct SandboxOpts {
+    /// Sparse root and scoped configuration inputs.
+    #[command(flatten)]
+    pub config: SandboxConfigSources,
+
+    /// Name for the sandbox. Auto-generated if omitted. Maximum 128 UTF-8 bytes.
+    #[arg(short, long)]
+    pub name: Option<String>,
+
+    /// Number of virtual CPUs to allocate.
+    #[arg(short = 'c', long)]
+    pub cpus: Option<u8>,
+
+    /// Boot-time maximum possible virtual CPUs.
+    #[arg(long = "max-cpus")]
+    pub max_cpus: Option<u8>,
+
+    /// Host CPU placement policy (inherit, auto, spread, compact).
+    #[arg(long = "cpu-placement", value_name = "POLICY")]
+    pub cpu_placement: Option<CpuPlacement>,
+
+    /// Host-defined placement profile name.
+    #[arg(long = "placement-profile", value_name = "NAME")]
+    pub placement_profile: Option<String>,
+
+    /// Amount of memory to allocate (e.g. 512M, 1G).
+    #[arg(short, long)]
+    pub memory: Option<String>,
+
+    /// Boot-time maximum hotpluggable memory (e.g. 1G, 8G).
+    #[arg(long = "max-memory", value_name = "SIZE")]
+    pub max_memory: Option<String>,
+
+    /// Guest transparent huge-page policy selected at boot.
+    #[arg(long, value_name = "POLICY", value_parser = ["always", "madvise", "never"])]
+    pub thp: Option<String>,
+
+    /// Guest wall-clock policy: `sync` (default) keeps the guest clock in step with the
+    /// host; `off` leaves it alone after boot, including across full snapshot restores.
+    #[arg(long = "guest-clock", value_name = "POLICY", value_parser = guest_clock_parser())]
+    pub guest_clock: Option<GuestClockPolicy>,
+
+    /// Mount a host path or named volume into the sandbox (`SOURCE:DEST[:OPTIONS]`).
+    /// OPTIONS may include paired `uid=<N>,gid=<N>` for directory-backed mounts.
+    #[arg(short, long)]
+    pub volume: Vec<String>,
+
+    /// Explicitly mount a host directory into the sandbox (`SOURCE:DEST[:OPTIONS]`).
+    ///
+    /// OPTIONS may include `quota=<size>` and `uid=<N>,gid=<N>` to present
+    /// host-created files as that guest owner; both IDs are required together.
+    #[arg(long = "mount-dir", value_name = "SOURCE:DEST[:OPTIONS]")]
+    pub mount_dir: Vec<String>,
+
+    /// Explicitly mount a host file into the sandbox (`SOURCE:DEST[:OPTIONS]`).
+    ///
+    /// OPTIONS may include `quota=<size>` and `uid=<N>,gid=<N>` to present the
+    /// host file as that guest owner; both IDs are required together.
+    #[arg(long = "mount-file", value_name = "SOURCE:DEST[:OPTIONS]")]
+    pub mount_file: Vec<String>,
+
+    /// Explicitly mount a disk image into the sandbox (`SOURCE:DEST[:OPTIONS]`).
+    #[arg(long = "mount-disk", value_name = "SOURCE:DEST[:OPTIONS]")]
+    pub mount_disk: Vec<String>,
+
+    /// Explicitly mount a named volume into the sandbox (`NAME:DEST[:OPTIONS]`).
+    /// OPTIONS may include paired `uid=<N>,gid=<N>` when the volume is a directory.
+    #[arg(long = "mount-named", value_name = "NAME:DEST[:OPTIONS]")]
+    pub mount_named: Vec<String>,
+
+    /// Create a private volume removed with this sandbox (`DEST[:OPTIONS]`).
+    /// Defaults to a directory; use `kind=disk,size=10G` for an ext4 disk.
+    #[arg(long = "mount-owned", value_name = "DEST[:OPTIONS]")]
+    pub mount_owned: Vec<String>,
+
+    /// Set the default working directory for commands.
+    #[arg(short, long)]
+    pub workdir: Option<String>,
+
+    /// Shell to use for interactive sessions (default: /bin/sh).
+    #[arg(long)]
+    pub shell: Option<String>,
+
+    /// Set an environment variable (KEY=value).
+    #[arg(short, long)]
+    pub env: Vec<String>,
+
+    /// Attach a label to the sandbox for metrics attribution (`KEY=VALUE`, or
+    /// bare `KEY` for a valueless marker). Repeatable. Surfaced as attributes on
+    /// the sandbox's metrics.
+    #[arg(long, value_name = "KEY[=VALUE]")]
+    pub label: Vec<String>,
+
+    /// Replace an existing sandbox with the same name.
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Timeout the existing sandbox gets after SIGTERM before it is
+    /// SIGKILLed during a replace. Accepts `0`, `500ms`, `5s`, `2m`.
+    /// Implies `--replace`. Default 10s when `--replace` is set on its
+    /// own. An expired timeout force-kills the prior sandbox; the
+    /// `create` call still proceeds.
+    #[arg(long, value_name = "DURATION")]
+    pub replace_with_timeout: Option<String>,
+
+    /// Suppress progress output.
+    #[arg(short, long)]
+    pub quiet: bool,
+
+    // --- Filesystem ---
+    /// Mount a temporary in-memory filesystem (PATH, PATH:SIZE, or PATH:SIZE:OPTIONS).
+    #[arg(long)]
+    pub tmpfs: Vec<String>,
+
+    /// In-guest security profile (default or restricted).
+    #[arg(long, value_parser = ["default", "restricted"])]
+    pub security: Option<String>,
+
+    /// Host-runtime deployment profile (single-tenant or multi-tenant).
+    /// Managed backends may enforce their own profile.
+    #[arg(long = "deployment-profile", value_parser = ["single-tenant", "multi-tenant"])]
+    pub deployment_profile: Option<String>,
+
+    /// Register a shell snippet as a named script (NAME=BODY). The body
+    /// supports `\n`, `\t`, `\r`, `\\`, `\"`, `\'` escapes; unknown escapes
+    /// are preserved verbatim. The snippet is wrapped with a shebang derived
+    /// from `--shell` (default `/bin/sh`) and made executable at
+    /// `/.msb/scripts/<name>`; the directory is on `PATH`.
+    #[arg(long, value_name = "NAME=BODY")]
+    pub script: Vec<String>,
+
+    /// Register exact inline script contents (NAME=BODY). No escape decoding
+    /// or shebang is added, so the caller must include a `#!` line if the
+    /// script should be directly executable.
+    #[arg(long, value_name = "NAME=BODY")]
+    pub script_raw: Vec<String>,
+
+    /// Register a script from a host file (NAME:PATH). Same destination as
+    /// `--script`; the file's contents are read verbatim at launch time.
+    #[arg(long, value_name = "NAME:PATH")]
+    pub script_path: Vec<String>,
+
+    /// Copy a host file or directory into the guest rootfs before boot (SRC:DST).
+    #[arg(long, value_name = "SRC:DST")]
+    pub copy: Vec<String>,
+
+    /// Copy a host file into the guest rootfs before boot (SRC:DST).
+    #[arg(long, value_name = "SRC:DST")]
+    pub copy_file: Vec<String>,
+
+    /// Copy a host directory into the guest rootfs before boot (SRC:DST).
+    #[arg(long, value_name = "SRC:DST")]
+    pub copy_dir: Vec<String>,
+
+    /// Create a directory in the guest rootfs before boot.
+    #[arg(long, value_name = "PATH")]
+    pub mkdir: Vec<String>,
+
+    /// Hide/remove a path from the guest rootfs before boot.
+    #[arg(long = "rm", value_name = "PATH")]
+    pub rm: Vec<String>,
+
+    // --- Image/Runtime overrides ---
+    /// Override the image's entrypoint executable. With `msb run`, pass its
+    /// arguments after the image and `--`.
+    #[arg(long, value_name = "EXECUTABLE")]
+    pub entrypoint: Option<String>,
+
+    /// Hand off PID 1 to this init binary inside the guest after agentd
+    /// finishes setup. Use `auto` to honor a known init at the start of
+    /// the image ENTRYPOINT (for example /init in s6-overlay images),
+    /// preserving attached init-entrypoint commands when needed, or to
+    /// probe common distro init paths when the image does not declare one.
+    #[arg(long, value_name = "PATH|auto")]
+    pub init: Option<String>,
+
+    /// Append an argv entry to the handoff init. Repeatable. Defaults
+    /// to `[<--init>]` when empty.
+    ///
+    /// `allow_hyphen_values` lets values like `--unit=multi-user.target`
+    /// pass through without clap trying to interpret them as flags.
+    #[arg(
+        long = "init-arg",
+        value_name = "STR",
+        allow_hyphen_values = true,
+        requires = "init"
+    )]
+    pub init_arg: Vec<String>,
+
+    /// Set an env var for the handoff init (KEY=VALUE). Repeatable.
+    /// Merged on top of the inherited env.
+    #[arg(long = "init-env", value_name = "KEY=VALUE", requires = "init")]
+    pub init_env: Vec<String>,
+
+    /// Set the guest hostname (defaults to a sandbox-name-derived hostname).
+    #[arg(short = 'H', long)]
+    pub hostname: Option<String>,
+
+    /// Run commands as the specified user (e.g. nobody, 1000, 1000:1000).
+    #[arg(short = 'u', long)]
+    pub user: Option<String>,
+
+    /// When to pull the image: always, if-missing (default), never.
+    #[arg(long)]
+    pub pull: Option<String>,
+
+    /// Root disk for OCI images (e.g. 8G, tmpfs:2G, flat:8G,
+    /// ./scratch.img, ./scratch.qcow2:format=qcow2,fstype=ext4).
+    #[arg(long = "root-disk", value_name = "SPEC")]
+    pub root_disk: Option<String>,
+
+    /// Deprecated alias for `--root-disk <SIZE>`.
+    #[arg(
+        long = "oci-upper-size",
+        value_name = "SIZE",
+        hide = true,
+        conflicts_with = "root_disk"
+    )]
+    pub oci_upper_size: Option<String>,
+
+    /// Log verbosity for the sandbox runtime (error, warn, info, debug, trace).
+    #[arg(long)]
+    pub log_level: Option<String>,
+
+    // --- Lifecycle ---
+    /// Kill the sandbox after this duration (e.g. 30s, 5m, 1h).
+    #[arg(long)]
+    pub max_duration: Option<String>,
+
+    /// Stop the sandbox after this period of inactivity (e.g. 30s, 5m, 1h).
+    #[arg(long)]
+    pub idle_timeout: Option<String>,
+
+    // --- Host communication ---
+    /// Expose a host local-IPC endpoint on a guest-to-host vsock port.
+    ///
+    /// Syntax: HOST_PATH:PORT, optionally followed by /stream or /dgram.
+    /// Stream is the default. Repeat the flag to expose multiple services.
+    #[arg(long, value_name = "HOST_PATH:PORT[/stream|/dgram]")]
+    pub vsock: Vec<String>,
+
+    // --- Networking (requires "net" feature) ---
+    /// Forward a host port to the sandbox (HOST:GUEST, BIND_ADDR:HOST:GUEST, and /udp variants).
+    #[cfg(feature = "net")]
+    #[arg(short, long)]
+    pub port: Vec<String>,
+
+    /// Accept-queue depth for published TCP ports (default: 1024; the host clamps it to its somaxconn).
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "DEPTH", value_parser = clap::value_parser!(u32).range(1..=i64::from(i32::MAX)))]
+    pub tcp_accept_queue_size: Option<u32>,
+
+    /// Disable all network access by default. Sugar for `--net-default deny`.
+    /// Combine with `--net-rule allow@<target>` entries to build an
+    /// allowlist; without rules, the guest has no network reachability.
+    #[cfg(feature = "net")]
+    #[arg(
+        long = "no-net",
+        conflicts_with_all = [
+            "net_conf",
+            "net_default",
+            "net_default_egress",
+            "net_default_ingress"
+        ]
+    )]
+    pub no_net: bool,
+
+    /// High-level network profile. Repeatable and comma-separated. Profiles
+    /// (`public`, `private`, `host`) compose and automatically enable gateway
+    /// DNS. `all` and `none` are terminal policies and cannot be combined with
+    /// profiles. Explicit `--net-rule` entries take precedence.
+    #[cfg(feature = "net")]
+    #[arg(
+        long = "net",
+        value_name = "PROFILE",
+        conflicts_with_all = [
+            "net_conf",
+            "no_net",
+            "net_default",
+            "net_default_egress",
+            "net_default_ingress"
+        ]
+    )]
+    pub net: Vec<String>,
+
+    /// Allow DNS responses pointing to private/internal IP addresses.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub no_dns_rebind_protection: bool,
+
+    /// Nameserver to forward DNS queries to (repeatable). Overrides the
+    /// nameservers in the host's `/etc/resolv.conf`. Accepts `IP` (port
+    /// defaults to 53) or `IP:PORT`.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "ADDR")]
+    pub dns_nameserver: Vec<String>,
+
+    /// Per-DNS-query timeout in milliseconds. Default: 5000.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "MS")]
+    pub dns_query_timeout_ms: Option<u64>,
+
+    /// IPv4 pool used for per-sandbox /30 guest subnets. Default: 172.16.0.0/12.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-ipv4-pool", value_name = "CIDR")]
+    pub net_ipv4_pool: Option<String>,
+
+    /// IPv6 pool used for per-sandbox /64 guest prefixes. Default: fd42:6d73:62::/48.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-ipv6-pool", value_name = "CIDR")]
+    pub net_ipv6_pool: Option<String>,
+
+    /// NAT64 /96 prefix for policy classification. Repeatable.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-nat64-prefix", value_name = "CIDR")]
+    pub net_nat64_prefix: Vec<String>,
+
+    /// Network rule. Repeatable; each value is a comma-separated list of
+    /// rule tokens. Token grammar:
+    /// `<action>[:<direction>]@<target>[:<proto>[:<ports>]]`.
+    ///
+    /// Target kinds: IPs/CIDRs, domains (`example.com`), domain suffixes
+    /// (`*.example.com` shorthand or `suffix=example.com`), and groups
+    /// (`public`, `private`, `multicast`, ...), plus the semantic `dns`
+    /// target for gateway UDP/TCP port 53. Suffixes must be at
+    /// least two labels (e.g. `*.example.com`, not `*.com`).
+    ///
+    /// Examples: --net-rule "allow@public"
+    /// --net-rule "deny@198.51.100.5,allow@public"
+    /// --net-rule "allow:ingress@private"
+    /// --net-rule "allow@example.com:tcp:443"
+    /// --net-rule "deny@*.ads.example.com"
+    #[cfg(feature = "net")]
+    #[arg(long = "net-rule", value_name = "TOKENS", conflicts_with = "net_conf")]
+    pub net_rule: Vec<String>,
+
+    /// Default action for traffic in both directions that doesn't match
+    /// any `--net-rule`. Sets egress and ingress symmetrically; use
+    /// `--net-default-egress` / `--net-default-ingress` to set them
+    /// independently.
+    #[cfg(feature = "net")]
+    #[arg(
+        long = "net-default",
+        value_name = "ACTION",
+        conflicts_with_all = ["net_conf", "net_default_egress", "net_default_ingress"],
+    )]
+    pub net_default: Option<String>,
+
+    /// Default action for egress traffic that doesn't match any
+    /// `--net-rule`. Default: deny (with an implicit allow@public rule
+    /// when no other rules are present).
+    #[cfg(feature = "net")]
+    #[arg(
+        long = "net-default-egress",
+        value_name = "ACTION",
+        conflicts_with = "net_conf"
+    )]
+    pub net_default_egress: Option<String>,
+
+    /// Default action for ingress traffic that doesn't match any
+    /// `--net-rule`. Default: allow (preserves today's unfiltered
+    /// published-port behavior when no ingress rules are set).
+    #[cfg(feature = "net")]
+    #[arg(
+        long = "net-default-ingress",
+        value_name = "ACTION",
+        conflicts_with = "net_conf"
+    )]
+    pub net_default_ingress: Option<String>,
+
+    /// Limit outbound (egress) bandwidth, e.g. 1M/1s. SIZE accepts
+    /// raw bytes plus K, M, and G suffixes; the interval defaults to one
+    /// second when omitted. Applies on the next sandbox start.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-egress-bandwidth", value_name = "SIZE[/DURATION]")]
+    pub net_egress_bandwidth: Option<String>,
+
+    /// One-time startup burst for the egress bandwidth limit, e.g. 512K.
+    /// Requires --net-egress-bandwidth.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-egress-bandwidth-burst", value_name = "SIZE")]
+    pub net_egress_bandwidth_burst: Option<String>,
+
+    /// Limit outbound (egress) packet rate, e.g. 1000/1s. The
+    /// interval defaults to one second when omitted.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-egress-ops", value_name = "COUNT[/DURATION]")]
+    pub net_egress_ops: Option<String>,
+
+    /// One-time startup burst for the egress packet-rate limit.
+    /// Requires --net-egress-ops.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-egress-ops-burst", value_name = "COUNT")]
+    pub net_egress_ops_burst: Option<u64>,
+
+    /// Limit inbound (ingress) bandwidth, e.g. 1M/1s. Same syntax
+    /// as --net-egress-bandwidth.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-ingress-bandwidth", value_name = "SIZE[/DURATION]")]
+    pub net_ingress_bandwidth: Option<String>,
+
+    /// One-time startup burst for the ingress bandwidth limit.
+    /// Requires --net-ingress-bandwidth.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-ingress-bandwidth-burst", value_name = "SIZE")]
+    pub net_ingress_bandwidth_burst: Option<String>,
+
+    /// Limit inbound (ingress) packet rate, e.g. 1000/1s.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-ingress-ops", value_name = "COUNT[/DURATION]")]
+    pub net_ingress_ops: Option<String>,
+
+    /// One-time startup burst for the ingress packet-rate limit.
+    /// Requires --net-ingress-ops.
+    #[cfg(feature = "net")]
+    #[arg(long = "net-ingress-ops-burst", value_name = "COUNT")]
+    pub net_ingress_ops_burst: Option<u64>,
+
+    /// Deprecated alias for --max-tcp-connections.
+    #[cfg(feature = "net")]
+    #[arg(long, conflicts_with = "max_tcp_connections")]
+    pub max_connections: Option<usize>,
+
+    /// Limit TCP connections; zero means unlimited.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub max_tcp_connections: Option<usize>,
+
+    /// Limit UDP relay sessions (default: unlimited single-tenant, 1024 multi-tenant; zero means unlimited).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub max_udp_connections: Option<usize>,
+
+    /// Require inspectable request authority for hostname allows (default: true).
+    #[cfg(feature = "net")]
+    #[arg(long = "net-strict", num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    pub net_strict: Option<bool>,
+
+    /// Ship the host's trusted root CAs into the guest. Opt in to make
+    /// outbound TLS work behind corporate MITM proxies (Warp Zero
+    /// Trust, Zscaler, etc.) whose gateway CA is installed on the host
+    /// but unknown to the guest's stock Mozilla bundle.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub trust_host_cas: bool,
+
+    /// Dial all outbound sandbox connections through this proxy.
+    /// Supports http://, socks4://, and socks5:// protocols.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "http://IP:PORT|socks[4|5]://IP:PORT")]
+    pub proxy: Option<String>,
+
+    /// Optional user ID for a SOCKS4 proxy.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "USER_ID", requires = "proxy")]
+    pub socks4_user_id: Option<String>,
+
+    /// Username for SOCKS5 username/password authentication.
+    #[cfg(feature = "net")]
+    #[arg(
+        long,
+        value_name = "USERNAME",
+        requires_all = ["proxy", "socks5_password_env"]
+    )]
+    pub socks5_username: Option<String>,
+
+    /// Host environment variable containing the SOCKS5 password.
+    #[cfg(feature = "net")]
+    #[arg(
+        long,
+        value_name = "ENV_VAR",
+        requires_all = ["proxy", "socks5_username"]
+    )]
+    pub socks5_password_env: Option<String>,
+
+    // --- TLS interception ---
+    /// Intercept and inspect HTTPS traffic via a built-in TLS proxy.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub tls_intercept: bool,
+
+    /// TCP port to apply TLS interception on (default: 443).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub tls_intercept_port: Vec<u16>,
+
+    /// Skip TLS interception for this domain (e.g. *.internal.com).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub tls_bypass: Vec<String>,
+
+    /// Allow QUIC/HTTP3 traffic (blocked by default when TLS interception is on).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub no_block_quic: bool,
+
+    /// Use a custom CA certificate for TLS interception (PEM file).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub tls_intercept_ca_cert: Option<PathBuf>,
+
+    /// Use a custom CA private key for TLS interception (PEM file).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub tls_intercept_ca_key: Option<PathBuf>,
+
+    /// Trust an additional CA certificate for upstream server verification (PEM file).
+    /// Can be specified multiple times.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub tls_upstream_ca_cert: Vec<PathBuf>,
+
+    /// Trust an additional CA certificate only for matching upstream hosts (PATTERN=PATH).
+    /// Can be specified multiple times.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "PATTERN=PATH")]
+    pub tls_upstream_ca_cert_for: Vec<String>,
+
+    /// Disable upstream certificate verification for matching upstream hosts.
+    /// Can be specified multiple times.
+    #[cfg(feature = "net")]
+    #[arg(long, value_name = "PATTERN")]
+    pub tls_no_verify_upstream_for: Vec<String>,
+
+    // --- Secrets ---
+    /// Configure a protected secret (`ENV[:OPTIONS]@HOST[,HOST...]`).
+    /// The value is read from the host environment variable ENV at start time
+    /// and stored only as a source reference, never inlined in the sandbox
+    /// config. Inline `ENV=VALUE@HOST` is rejected; export the value and use
+    /// `ENV[:OPTIONS]@HOST[,HOST...]`.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub secret: Vec<String>,
+
+    /// Action when a secret placeholder is blocked (block, block-and-log, block-and-terminate).
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub secret_violation_action: Option<String>,
+}
+
+/// Parsed `--secret` policy for one environment variable.
+///
+/// Shared with live modification parsing, which uses only wire-model types.
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedSecret {
+    pub(crate) env_var: String,
+    pub(crate) allowed_hosts: Vec<String>,
+    pub(crate) passthrough_hosts: Vec<String>,
+    pub(crate) substitute_headers: bool,
+    pub(crate) substitute_query: bool,
+    pub(crate) substitute_body: bool,
+}
+
+/// Parsed public CLI mount options.
+#[derive(Debug, Default)]
+struct CliMountOptions {
+    readonly: bool,
+    noexec: bool,
+    nosuid: bool,
+    nodev: bool,
+    follow_root_symlinks: bool,
+    stat_virtualization: Option<microsandbox::sandbox::StatVirtualization>,
+    host_permissions: Option<microsandbox::sandbox::HostPermissions>,
+    size_mib: Option<u32>,
+    quota_mib: Option<u32>,
+    named_kind: Option<VolumeKind>,
+    fstype: Option<String>,
+    format: Option<DiskImageFormat>,
+    override_uid: Option<u32>,
+    override_gid: Option<u32>,
+}
+
+/// Which keyed options are valid for a public CLI mount flag.
+#[derive(Debug, Clone, Copy, Default)]
+struct CliMountOptionSupport {
+    policies: bool,
+    size: bool,
+    quota: bool,
+    named_kind: bool,
+    fstype: bool,
+    format: bool,
+    owner: bool,
+}
+
+/// Parsed `SOURCE:DEST[:OPTIONS]` mount specification.
+struct ParsedCliMountSpec<'a> {
+    source: &'a str,
+    guest: &'a str,
+    options: CliMountOptions,
+}
+
+/// Expected host path kind for explicit bind mount flags.
+enum HostPathKind {
+    Directory,
+    File,
+}
+
+/// File or directory copy behavior.
+#[derive(Debug, Clone, Copy)]
+enum CopyKind {
+    Infer,
+    File,
+    Directory,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl SandboxOpts {
+    /// Builds the protocol-specific proxy selected by the CLI flags.
+    #[cfg(feature = "net")]
+    fn build_outbound_proxy(&self) -> anyhow::Result<Option<OutboundProxy>> {
+        let Some(raw) = self.proxy.as_deref() else {
+            if self.socks4_user_id.is_some()
+                || self.socks5_username.is_some()
+                || self.socks5_password_env.is_some()
+            {
+                anyhow::bail!("proxy authentication flags require --proxy");
+            }
+            return Ok(None);
+        };
+
+        match raw.parse::<OutboundProxy>()? {
+            OutboundProxy::HttpConnect { address } => {
+                if self.socks4_user_id.is_some()
+                    || self.socks5_username.is_some()
+                    || self.socks5_password_env.is_some()
+                {
+                    anyhow::bail!(
+                        "SOCKS authentication flags cannot be used with an http:// proxy"
+                    );
+                }
+
+                Ok(Some(
+                    OutboundProxyBuilder::new()
+                        .http_connect(address.to_string())
+                        .build()?,
+                ))
+            }
+            OutboundProxy::Socks4 { address, .. } => {
+                if self.socks5_username.is_some() || self.socks5_password_env.is_some() {
+                    anyhow::bail!(
+                        "--socks5-username and --socks5-password-env require a socks5:// proxy"
+                    );
+                }
+
+                let proxy = OutboundProxyBuilder::new().socks4(address.to_string());
+                let proxy = match self.socks4_user_id.as_deref() {
+                    Some(user_id) => proxy.user_id(user_id),
+                    None => proxy,
+                };
+                Ok(Some(proxy.build()?))
+            }
+            OutboundProxy::Socks5 { address, .. } => {
+                if self.socks4_user_id.is_some() {
+                    anyhow::bail!("--socks4-user-id requires a socks4:// proxy");
+                }
+
+                let proxy = OutboundProxyBuilder::new().socks5(address.to_string());
+                let proxy = match (
+                    self.socks5_username.as_deref(),
+                    self.socks5_password_env.as_deref(),
+                ) {
+                    (Some(username), Some(password_env)) => {
+                        proxy.credentials(username, microsandbox::SecretSource::env(password_env))
+                    }
+                    (Some(_), None) => {
+                        anyhow::bail!("--socks5-username requires --socks5-password-env")
+                    }
+                    (None, Some(_)) => {
+                        anyhow::bail!("--socks5-password-env requires --socks5-username")
+                    }
+                    (None, None) => proxy,
+                };
+                Ok(Some(proxy.build()?))
+            }
+            _ => anyhow::bail!("unsupported outbound proxy protocol"),
+        }
+    }
+
+    /// Resolves the root disk specification selected by the CLI flags.
+    fn root_disk_spec(&self) -> anyhow::Result<Option<RootDiskSpec>> {
+        self.root_disk
+            .as_deref()
+            .or(self.oci_upper_size.as_deref())
+            .map(parse_root_disk_spec)
+            .transpose()
+    }
+
+    /// Resolves script flags into a deduplicated list preserving argv order.
+    fn collect_scripts(&self) -> anyhow::Result<Vec<(String, String)>> {
+        use std::collections::HashSet;
+
+        let mut scripts =
+            Vec::with_capacity(self.script.len() + self.script_raw.len() + self.script_path.len());
+        let mut seen = HashSet::new();
+
+        for spec in &self.script {
+            let (name, body) = parse_script_spec(spec, "script")?;
+            if !seen.insert(name.clone()) {
+                anyhow::bail!("script name '{name}' specified more than once");
+            }
+            let decoded = decode_script_escapes(&body);
+            scripts.push((name, wrap_shell_script(self.shell.as_deref(), &decoded)));
+        }
+        for spec in &self.script_raw {
+            let (name, body) = parse_script_spec(spec, "script-raw")?;
+            if !seen.insert(name.clone()) {
+                anyhow::bail!("script name '{name}' specified more than once");
+            }
+            scripts.push((name, body));
+        }
+        for spec in &self.script_path {
+            let (name, content) = parse_script_path(spec)?;
+            if !seen.insert(name.clone()) {
+                anyhow::bail!("script name '{name}' specified more than once");
+            }
+            scripts.push((name, content));
+        }
+
+        Ok(scripts)
+    }
+
+    /// Returns true when any CLI flag requires building network configuration.
+    #[cfg(feature = "net")]
+    fn has_network_config(&self) -> bool {
+        self.no_dns_rebind_protection
+            || !self.dns_nameserver.is_empty()
+            || self.dns_query_timeout_ms.is_some()
+            || !self.net_rule.is_empty()
+            || !self.net.is_empty()
+            || self.no_net
+            || self.net_default.is_some()
+            || self.net_default_egress.is_some()
+            || self.net_default_ingress.is_some()
+            || self.net_ipv4_pool.is_some()
+            || self.net_ipv6_pool.is_some()
+            || !self.net_nat64_prefix.is_empty()
+            || self.net_egress_bandwidth.is_some()
+            || self.net_egress_bandwidth_burst.is_some()
+            || self.net_egress_ops.is_some()
+            || self.net_egress_ops_burst.is_some()
+            || self.net_ingress_bandwidth.is_some()
+            || self.net_ingress_bandwidth_burst.is_some()
+            || self.net_ingress_ops.is_some()
+            || self.net_ingress_ops_burst.is_some()
+            || self.max_connections.is_some()
+            || self.max_tcp_connections.is_some()
+            || self.max_udp_connections.is_some()
+            || self.tcp_accept_queue_size.is_some()
+            || self.net_strict.is_some()
+            || self.trust_host_cas
+            || self.tls_intercept
+            || !self.tls_intercept_port.is_empty()
+            || !self.tls_bypass.is_empty()
+            || self.no_block_quic
+            || self.tls_intercept_ca_cert.is_some()
+            || self.tls_intercept_ca_key.is_some()
+            || !self.tls_upstream_ca_cert.is_empty()
+            || !self.tls_upstream_ca_cert_for.is_empty()
+            || !self.tls_no_verify_upstream_for.is_empty()
+            || self.secret_violation_action.is_some()
+    }
+
+    /// Builds one direction of the network rate limiter from its related flags.
+    #[cfg(feature = "net")]
+    fn build_rate_limiter(
+        &self,
+        direction: NetworkRateLimitDirection,
+    ) -> anyhow::Result<Option<CliRateLimiter>> {
+        let (bandwidth, bandwidth_burst, ops, ops_burst) = match direction {
+            NetworkRateLimitDirection::Egress => (
+                self.net_egress_bandwidth.as_deref(),
+                self.net_egress_bandwidth_burst.as_deref(),
+                self.net_egress_ops.as_deref(),
+                self.net_egress_ops_burst,
+            ),
+            NetworkRateLimitDirection::Ingress => (
+                self.net_ingress_bandwidth.as_deref(),
+                self.net_ingress_bandwidth_burst.as_deref(),
+                self.net_ingress_ops.as_deref(),
+                self.net_ingress_ops_burst,
+            ),
+        };
+
+        if bandwidth.is_none() && bandwidth_burst.is_none() && ops.is_none() && ops_burst.is_none()
+        {
+            return Ok(None);
+        }
+
+        let bandwidth = bandwidth
+            .map(|spec| {
+                parse_rate(&format!("--net-{direction}-bandwidth"), spec, |s| {
+                    ui::parse_size_bytes(s).map_err(anyhow::Error::msg)
+                })
+            })
+            .transpose()?;
+        let bandwidth_burst = bandwidth_burst
+            .map(|s| {
+                ui::parse_size_bytes(s)
+                    .map_err(|e| anyhow::anyhow!("--net-{direction}-bandwidth-burst: {e}"))
+            })
+            .transpose()?;
+        let ops = ops
+            .map(|spec| {
+                parse_rate(&format!("--net-{direction}-ops"), spec, |s| {
+                    s.parse::<u64>().map_err(anyhow::Error::from)
+                })
+            })
+            .transpose()?;
+
+        Ok(Some(CliRateLimiter {
+            bandwidth,
+            bandwidth_burst,
+            ops,
+            ops_burst,
+        }))
+    }
+
+    /// Builds the network policy selected by the related CLI flags.
+    #[cfg(feature = "net")]
+    pub(super) fn build_network_policy(
+        &self,
+    ) -> anyhow::Result<Option<microsandbox_network::policy::NetworkPolicy>> {
+        use microsandbox_network::policy::{Action, NetworkPolicy, NetworkProfile};
+
+        use crate::net_rule::parse_rule_list;
+
+        let no_flags = self.net.is_empty()
+            && self.net_rule.is_empty()
+            && !self.no_net
+            && self.net_default.is_none()
+            && self.net_default_egress.is_none()
+            && self.net_default_ingress.is_none();
+        if no_flags {
+            return Ok(None);
+        }
+
+        let mut rules = Vec::new();
+        for arg in &self.net_rule {
+            let parsed = parse_rule_list(arg).map_err(anyhow::Error::from)?;
+            rules.extend(parsed);
+        }
+
+        if !self.net.is_empty() {
+            let mut profiles = Vec::new();
+            let mut terminal = None;
+            for raw in self
+                .net
+                .iter()
+                .flat_map(|arg| arg.split(','))
+                .map(str::trim)
+            {
+                if raw.is_empty() {
+                    anyhow::bail!(
+                        "empty --net profile; expected public, private, host, all, or none"
+                    );
+                }
+                match raw {
+                    "public" => profiles.push(NetworkProfile::Public),
+                    "private" => profiles.push(NetworkProfile::Private),
+                    "host" => profiles.push(NetworkProfile::Host),
+                    "all" | "none" => {
+                        if let Some(previous) = terminal {
+                            if previous == raw {
+                                anyhow::bail!("--net `{raw}` may only be specified once");
+                            }
+                            anyhow::bail!(
+                                "--net terminal profiles `all` and `none` cannot be combined"
+                            );
+                        }
+                        terminal = Some(raw);
+                    }
+                    other => anyhow::bail!(
+                        "unknown --net profile {other:?}; expected public, private, host, all, or none"
+                    ),
+                }
+            }
+            if let Some(terminal) = terminal {
+                if !profiles.is_empty() {
+                    anyhow::bail!(
+                        "--net `{terminal}` cannot be combined with public, private, or host"
+                    );
+                }
+                let mut policy = match terminal {
+                    "all" => NetworkPolicy::allow_all(),
+                    "none" => NetworkPolicy::none(),
+                    _ => unreachable!("validated terminal profile"),
+                };
+                policy.rules = rules;
+                return Ok(Some(policy));
+            }
+
+            let mut policy = NetworkPolicy::from_profiles(profiles);
+            rules.append(&mut policy.rules);
+            policy.rules = rules;
+            return Ok(Some(policy));
+        }
+
+        let parse_action = |label: &str, raw: &str| -> anyhow::Result<Action> {
+            match raw {
+                "allow" => Ok(Action::Allow),
+                "deny" => Ok(Action::Deny),
+                other => {
+                    anyhow::bail!("unknown {label} value {other:?}; expected `allow` or `deny`")
+                }
+            }
+        };
+
+        let symmetric = if self.no_net {
+            Some(Action::Deny)
+        } else if let Some(raw) = self.net_default.as_deref() {
+            Some(parse_action("--net-default", raw)?)
+        } else {
+            None
+        };
+
+        let baseline = NetworkPolicy::default();
+        let default_egress = match (symmetric, self.net_default_egress.as_deref()) {
+            (_, Some(raw)) => parse_action("--net-default-egress", raw)?,
+            (Some(action), None) => action,
+            (None, None) => baseline.default_egress,
+        };
+        let default_ingress = match (symmetric, self.net_default_ingress.as_deref()) {
+            (_, Some(raw)) => parse_action("--net-default-ingress", raw)?,
+            (Some(action), None) => action,
+            (None, None) => baseline.default_ingress,
+        };
+
+        Ok(Some(NetworkPolicy {
+            default_egress,
+            default_ingress,
+            rules,
+        }))
+    }
+
+    /// Returns true if any creation-time configuration flag was set.
+    pub fn has_creation_flags(&self) -> bool {
+        let base = self.cpus.is_some()
+            || self.max_cpus.is_some()
+            || self.cpu_placement.is_some()
+            || self.placement_profile.is_some()
+            || self.memory.is_some()
+            || self.max_memory.is_some()
+            || self.thp.is_some()
+            || self.guest_clock.is_some()
+            || !self.volume.is_empty()
+            || !self.mount_dir.is_empty()
+            || !self.mount_file.is_empty()
+            || !self.mount_disk.is_empty()
+            || !self.mount_named.is_empty()
+            || !self.mount_owned.is_empty()
+            || self.workdir.is_some()
+            || self.shell.is_some()
+            || !self.env.is_empty()
+            || !self.tmpfs.is_empty()
+            || !self.script.is_empty()
+            || !self.script_raw.is_empty()
+            || !self.script_path.is_empty()
+            || !self.copy.is_empty()
+            || !self.copy_file.is_empty()
+            || !self.copy_dir.is_empty()
+            || !self.mkdir.is_empty()
+            || !self.rm.is_empty()
+            || self.entrypoint.is_some()
+            || self.init.is_some()
+            || !self.init_arg.is_empty()
+            || !self.init_env.is_empty()
+            || self.hostname.is_some()
+            || self.user.is_some()
+            || self.pull.is_some()
+            || self.root_disk.is_some()
+            || self.oci_upper_size.is_some()
+            || self.log_level.is_some()
+            || self.max_duration.is_some()
+            || self.idle_timeout.is_some()
+            || self.security.is_some()
+            || !self.vsock.is_empty();
+
+        #[cfg(feature = "net")]
+        let net = !self.port.is_empty()
+            || self.no_net
+            || !self.net.is_empty()
+            || self.no_dns_rebind_protection
+            || !self.dns_nameserver.is_empty()
+            || self.dns_query_timeout_ms.is_some()
+            || !self.net_rule.is_empty()
+            || self.net_default.is_some()
+            || self.net_default_egress.is_some()
+            || self.net_default_ingress.is_some()
+            || self.net_ipv4_pool.is_some()
+            || self.net_ipv6_pool.is_some()
+            || !self.net_nat64_prefix.is_empty()
+            || self.net_egress_bandwidth.is_some()
+            || self.net_egress_bandwidth_burst.is_some()
+            || self.net_egress_ops.is_some()
+            || self.net_egress_ops_burst.is_some()
+            || self.net_ingress_bandwidth.is_some()
+            || self.net_ingress_bandwidth_burst.is_some()
+            || self.net_ingress_ops.is_some()
+            || self.net_ingress_ops_burst.is_some()
+            || self.max_connections.is_some()
+            || self.max_tcp_connections.is_some()
+            || self.max_udp_connections.is_some()
+            || self.tcp_accept_queue_size.is_some()
+            || self.net_strict.is_some()
+            || self.trust_host_cas
+            || self.proxy.is_some()
+            || self.socks4_user_id.is_some()
+            || self.socks5_username.is_some()
+            || self.socks5_password_env.is_some()
+            || self.tls_intercept
+            || !self.tls_intercept_port.is_empty()
+            || !self.tls_bypass.is_empty()
+            || self.no_block_quic
+            || self.tls_intercept_ca_cert.is_some()
+            || self.tls_intercept_ca_key.is_some()
+            || !self.tls_upstream_ca_cert.is_empty()
+            || !self.tls_upstream_ca_cert_for.is_empty()
+            || !self.tls_no_verify_upstream_for.is_empty()
+            || !self.secret.is_empty()
+            || self.secret_violation_action.is_some();
+
+        #[cfg(not(feature = "net"))]
+        let net = false;
+
+        base || net || self.config.any()
+    }
+}
+
+impl SandboxConfigSources {
+    /// Returns true when at least one explicit config path was supplied.
+    pub fn any(&self) -> bool {
+        !self.sources.is_empty()
+    }
+
+    /// Iterate over configuration sources in command-line order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SandboxConfigSource> {
+        self.sources.iter()
+    }
+
+    #[cfg(test)]
+    /// Append a source while constructing resolver fixtures.
+    pub(crate) fn source(mut self, kind: SandboxConfigKind, path: impl Into<PathBuf>) -> Self {
+        self.sources.push(SandboxConfigSource {
+            kind,
+            path: path.into(),
+        });
+        self
+    }
+}
+
+impl SandboxConfigKind {
+    /// Every supported source kind, in declaration order for help output.
+    const ALL: [Self; 7] = [
+        Self::Root,
+        Self::Network,
+        Self::Resources,
+        Self::Runtime,
+        Self::Filesystem,
+        Self::Secrets,
+        Self::Scripts,
+    ];
+
+    /// The clap argument identifier used by cross-argument constraints.
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Root => "conf",
+            Self::Network => "net_conf",
+            Self::Resources => "resource_conf",
+            Self::Runtime => "runtime_conf",
+            Self::Filesystem => "fs_conf",
+            Self::Secrets => "secret_conf",
+            Self::Scripts => "script_conf",
+        }
+    }
+
+    /// The long option spelling, without its leading dashes.
+    const fn long(self) -> &'static str {
+        match self {
+            Self::Root => "conf",
+            Self::Network => "net-conf",
+            Self::Resources => "resource-conf",
+            Self::Runtime => "runtime-conf",
+            Self::Filesystem => "fs-conf",
+            Self::Secrets => "secret-conf",
+            Self::Scripts => "script-conf",
+        }
+    }
+
+    /// The long option spelling used when persisting an installed alias.
+    pub(crate) fn flag(self) -> String {
+        format!("--{}", self.long())
+    }
+
+    /// User-facing help for this configuration source.
+    const fn help(self) -> &'static str {
+        match self {
+            Self::Root => "Load a sparse single-sandbox configuration",
+            Self::Network => "Load an unwrapped network configuration",
+            Self::Resources => "Load an unwrapped resource and lifecycle configuration",
+            Self::Runtime => "Load an unwrapped runtime configuration",
+            Self::Filesystem => "Load an unwrapped filesystem configuration",
+            Self::Secrets => "Load an unwrapped secret-name map",
+            Self::Scripts => "Load an unwrapped script-name map",
+        }
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl Args for SandboxConfigSources {
+    fn augment_args(command: Command) -> Command {
+        SandboxConfigKind::ALL
+            .into_iter()
+            .fold(command, |command, kind| {
+                command.arg(
+                    Arg::new(kind.id())
+                        .long(kind.long())
+                        .value_name("PATH")
+                        .help(kind.help())
+                        .action(ArgAction::Append)
+                        .value_parser(clap::value_parser!(PathBuf)),
+                )
+            })
+    }
+
+    fn augment_args_for_update(command: Command) -> Command {
+        Self::augment_args(command)
+    }
+}
+
+impl FromArgMatches for SandboxConfigSources {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        let mut indexed_sources = Vec::new();
+
+        for kind in SandboxConfigKind::ALL {
+            let Some(indices) = matches.indices_of(kind.id()) else {
+                continue;
+            };
+            let Some(paths) = matches.get_many::<PathBuf>(kind.id()) else {
+                continue;
+            };
+
+            indexed_sources.extend(indices.zip(paths).map(|(index, path)| {
+                (
+                    index,
+                    SandboxConfigSource {
+                        kind,
+                        path: path.clone(),
+                    },
+                )
+            }));
+        }
+
+        // Clap retains an index for each value. Sorting those indices recovers interleaving across
+        // independently named flags, which separate Vec fields cannot represent.
+        indexed_sources.sort_by_key(|(index, _)| *index);
+
+        Ok(Self {
+            sources: indexed_sources
+                .into_iter()
+                .map(|(_, source)| source)
+                .collect(),
+        })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        *self = Self::from_arg_matches(matches)?;
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Apply common sandbox options to a builder.
+pub fn apply_sandbox_opts(
+    builder: SandboxBuilder,
+    opts: &SandboxOpts,
+) -> anyhow::Result<SandboxBuilder> {
+    apply_sandbox_opts_inner(builder, opts, true)
+}
+
+/// Apply explicit CLI options after a sparse configuration patch.
+///
+/// The SDK patch has already populated lower-precedence values. Normal builder methods applied by
+/// this adapter therefore retain the same last-write-wins behavior as direct SDK usage.
+pub fn apply_sandbox_opts_after_config(
+    builder: SandboxBuilder,
+    opts: &SandboxOpts,
+) -> anyhow::Result<SandboxBuilder> {
+    apply_sandbox_opts_inner(builder, opts, true)
+}
+
+fn apply_sandbox_opts_inner(
+    mut builder: SandboxBuilder,
+    opts: &SandboxOpts,
+    _apply_cli_network_policy: bool,
+) -> anyhow::Result<SandboxBuilder> {
+    // --- Basic resources ---
+    if let Some(cpus) = opts.cpus {
+        builder = builder.cpus(cpus);
+    }
+    if let Some(max_cpus) = opts.max_cpus {
+        builder = builder.max_cpus(max_cpus);
+    }
+    if let Some(cpu_placement) = opts.cpu_placement {
+        builder = builder.cpu_placement(cpu_placement);
+    }
+    if let Some(ref placement_profile) = opts.placement_profile {
+        builder = builder.placement_profile(placement_profile);
+    }
+    if let Some(ref mem) = opts.memory {
+        builder = builder.memory(ui::parse_size_mib(mem).map_err(anyhow::Error::msg)?);
+    }
+    if let Some(ref max_memory) = opts.max_memory {
+        builder = builder.max_memory(ui::parse_size_mib(max_memory).map_err(anyhow::Error::msg)?);
+    }
+    if let Some(ref thp) = opts.thp {
+        let policy = thp
+            .parse::<TransparentHugePagePolicy>()
+            .map_err(anyhow::Error::msg)?;
+        builder = builder.thp(policy);
+    }
+    if let Some(policy) = opts.guest_clock {
+        builder = builder.guest_clock(policy);
+    }
+    if let Some(ref workdir) = opts.workdir {
+        builder = builder.workdir(workdir);
+    }
+    if let Some(ref shell) = opts.shell {
+        validate_shell(shell)?;
+        builder = builder.shell(shell);
+    }
+    if let Some(ref timeout) = opts.replace_with_timeout {
+        let d =
+            parse_duration(timeout).map_err(|e| anyhow::anyhow!("--replace-with-timeout: {e}"))?;
+        builder = builder.replace_with_timeout(d);
+    } else if opts.replace {
+        builder = builder.replace();
+    }
+
+    // --- Environment ---
+    for env_str in &opts.env {
+        let (k, v) = ui::parse_env(env_str).map_err(anyhow::Error::msg)?;
+        builder = builder.env(k, v);
+    }
+
+    // --- Labels ---
+    for label_str in &opts.label {
+        let (k, v) = ui::parse_label(label_str);
+        builder = builder.label(k, v);
+    }
+
+    // --- Volumes ---
+    for vol_str in &opts.volume {
+        builder = apply_volume(builder, vol_str)?;
+    }
+    for mount_str in &opts.mount_dir {
+        builder = apply_explicit_dir_mount(builder, mount_str)?;
+    }
+    for mount_str in &opts.mount_file {
+        builder = apply_explicit_file_mount(builder, mount_str)?;
+    }
+    for mount_str in &opts.mount_disk {
+        builder = apply_explicit_disk_mount(builder, mount_str)?;
+    }
+    for mount_str in &opts.mount_named {
+        builder = apply_explicit_named_mount(builder, mount_str)?;
+    }
+    for mount_str in &opts.mount_owned {
+        builder = apply_owned_mount(builder, mount_str)?;
+    }
+
+    // --- Tmpfs ---
+    for tmpfs_str in &opts.tmpfs {
+        let (path, size, options) = parse_tmpfs(tmpfs_str)?;
+        builder = builder.volume(&path, move |mut m| {
+            m = m.tmpfs();
+            if let Some(size_mib) = size {
+                m = m.size(size_mib);
+            }
+            if options.readonly {
+                m = m.readonly();
+            }
+            if options.noexec {
+                m = m.noexec();
+            }
+            if options.nosuid {
+                m = m.nosuid();
+            }
+            if options.nodev {
+                m = m.nodev();
+            }
+            m
+        });
+    }
+
+    // --- Scripts ---
+    for (name, content) in opts.collect_scripts()? {
+        builder = builder.script(name, content);
+    }
+
+    // --- Rootfs patches ---
+    builder = apply_rootfs_patches(builder, opts)?;
+
+    // --- Image/Runtime overrides ---
+    if let Some(ref ep) = opts.entrypoint {
+        builder = builder.entrypoint(vec![ep.clone()]);
+    }
+    if let Some(ref hostname) = opts.hostname {
+        builder = builder.hostname(hostname);
+    }
+    if let Some(ref user) = opts.user {
+        builder = builder.user(user);
+    }
+    if let Some(ref pull) = opts.pull {
+        builder = builder.pull_policy(parse_pull_policy(pull)?);
+    }
+    if let Some(spec) = opts.root_disk_spec()? {
+        builder = builder.root_disk_with(|d| spec.apply(d));
+    }
+    if let Some(ref security) = opts.security {
+        builder = builder.security(parse_security_profile(security)?);
+    }
+    if let Some(ref profile) = opts.deployment_profile {
+        builder = builder.deployment_profile(parse_deployment_profile(profile)?);
+    }
+
+    // --- Handoff init ---
+    // clap's `requires = "init"` already enforces that --init-arg /
+    // --init-env can't appear without --init, so we don't re-check here.
+    if let Some(ref init_path) = opts.init {
+        // `auto` is the magic sentinel that asks agentd to probe a
+        // candidate list inside the guest rootfs. Anything else must
+        // be an absolute path so the eventual execve can find it.
+        // Checked textually — `Path::is_absolute` follows host semantics
+        // and treats `/sbin/init` as relative on Windows.
+        if init_path != microsandbox_protocol::HANDOFF_INIT_AUTO && !init_path.starts_with('/') {
+            anyhow::bail!("--init must be an absolute path or `auto`, got: {init_path}");
+        }
+        if opts.init_arg.is_empty() && opts.init_env.is_empty() {
+            builder = builder.init(init_path);
+        } else {
+            let mut init_envs = Vec::with_capacity(opts.init_env.len());
+            for entry in &opts.init_env {
+                let (k, v) = ui::parse_env(entry).map_err(anyhow::Error::msg)?;
+                init_envs.push((k, v));
+            }
+            let init_args = opts.init_arg.clone();
+            builder = builder.init_with(init_path, |i| i.args(init_args).envs(init_envs));
+        }
+    }
+
+    // --- Log level ---
+    if let Some(ref level) = opts.log_level {
+        builder = builder.log_level(parse_log_level(level)?);
+    }
+
+    // --- Lifecycle ---
+    if let Some(ref dur) = opts.max_duration {
+        builder = builder.max_duration(parse_duration_secs(dur)?);
+    }
+    if let Some(ref dur) = opts.idle_timeout {
+        builder = builder.idle_timeout(parse_duration_secs(dur)?);
+    }
+
+    // --- Host communication ---
+    for route in &opts.vsock {
+        let (host_socket, port, socket_type) = parse_vsock_route(route)?;
+        builder = match socket_type {
+            VsockSocketType::Stream => builder.vsock(host_socket, port),
+            VsockSocketType::Dgram => builder.vsock_dgram(host_socket, port),
+        };
+    }
+
+    // --- Networking ---
+    #[cfg(feature = "net")]
+    {
+        builder = apply_network_opts(builder, opts, _apply_cli_network_policy)?;
+    }
+
+    Ok(builder)
+}
+
+/// Parse the clock policy at the CLI boundary while retaining possible values in help.
+pub(crate) fn guest_clock_parser() -> impl TypedValueParser<Value = GuestClockPolicy> {
+    PossibleValuesParser::new(["sync", "off"]).try_map(|value| value.parse::<GuestClockPolicy>())
+}
+
+/// Parse `HOST_PATH:PORT[/stream|/dgram]` without treating colons in the
+/// host path as separators. Stream is intentionally the compact default.
+pub(crate) fn parse_vsock_route(spec: &str) -> anyhow::Result<(PathBuf, u32, VsockSocketType)> {
+    let (host_socket, endpoint) = spec.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!("--vsock must use HOST_PATH:PORT[/stream|/dgram], got {spec:?}")
+    })?;
+    if host_socket.is_empty() {
+        anyhow::bail!("--vsock host path cannot be empty");
+    }
+
+    let (port, socket_type) = match endpoint.rsplit_once('/') {
+        None => (endpoint, VsockSocketType::Stream),
+        Some((port, "stream")) => (port, VsockSocketType::Stream),
+        Some((port, "dgram")) => (port, VsockSocketType::Dgram),
+        Some((_, kind)) => {
+            anyhow::bail!("--vsock socket type must be stream or dgram, got {kind:?}")
+        }
+    };
+    let port = port.parse::<u32>().map_err(|_| {
+        anyhow::anyhow!("--vsock port must be an unsigned 32-bit integer, got {port:?}")
+    })?;
+    let host_socket = PathBuf::from(host_socket);
+    if !host_socket.is_absolute() {
+        anyhow::bail!(
+            "--vsock host path must be absolute, got {}",
+            host_socket.display()
+        );
+    }
+
+    Ok((host_socket, port, socket_type))
+}
+
+/// Parsed `--root-disk` value, classified before it touches the builder.
+#[derive(Debug)]
+enum RootDiskSpec {
+    Managed {
+        size_mib: u32,
+    },
+    Tmpfs {
+        size_mib: Option<u32>,
+    },
+    DiskImage {
+        path: String,
+        format: Option<DiskImageFormat>,
+        fstype: Option<String>,
+    },
+    Flat {
+        size_mib: Option<u32>,
+        fstype: Option<String>,
+        clone: FlatClone,
+    },
+}
+
+impl RootDiskSpec {
+    fn apply(self, mut d: RootDiskBuilder) -> RootDiskBuilder {
+        match self {
+            Self::Managed { size_mib } => d.size(size_mib),
+            Self::Tmpfs { size_mib } => {
+                d = d.tmpfs();
+                if let Some(size_mib) = size_mib {
+                    d = d.size(size_mib);
+                }
+                d
+            }
+            Self::DiskImage {
+                path,
+                format,
+                fstype,
+            } => {
+                d = d.disk_image(path);
+                if let Some(format) = format {
+                    d = d.format(format);
+                }
+                if let Some(fstype) = fstype {
+                    d = d.fstype(fstype);
+                }
+                d
+            }
+            Self::Flat {
+                size_mib,
+                fstype,
+                clone,
+            } => {
+                d = d.flat().clone_strategy(clone);
+                if let Some(size_mib) = size_mib {
+                    d = d.size(size_mib);
+                }
+                if let Some(fstype) = fstype {
+                    d = d.fstype(fstype);
+                }
+                d
+            }
+        }
+    }
+}
+
+/// Classify a `--root-disk` value, following the `SOURCE[:OPTIONS]` shape of
+/// the volume flags: a bare size means the managed ext4 upper, `tmpfs[:SIZE]`
+/// a RAM-backed upper, and a path a user-supplied disk image with optional
+/// comma-separated options after a colon (`format=raw|qcow2`, `fstype=...`).
+/// `flat[:SIZE]` selects one complete managed root filesystem and accepts
+/// `fstype=` plus `clone=` options.
+fn parse_root_disk_spec(spec: &str) -> anyhow::Result<RootDiskSpec> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        anyhow::bail!(
+            "--root-disk requires a value (e.g. 8G, tmpfs:2G, flat:8G, ./scratch.qcow2:format=qcow2)"
+        );
+    }
+
+    if spec == "tmpfs" {
+        return Ok(RootDiskSpec::Tmpfs { size_mib: None });
+    }
+    if let Some(size) = spec.strip_prefix("tmpfs:") {
+        let size_mib = ui::parse_size_mib(size).map_err(anyhow::Error::msg)?;
+        return Ok(RootDiskSpec::Tmpfs {
+            size_mib: Some(size_mib),
+        });
+    }
+    if spec == "flat" {
+        return Ok(RootDiskSpec::Flat {
+            size_mib: None,
+            fstype: None,
+            clone: FlatClone::Auto,
+        });
+    }
+    if let Some(options) = spec.strip_prefix("flat:") {
+        return parse_flat_root_disk_options(options);
+    }
+
+    // Split SOURCE[:OPTIONS] on the first colon that isn't a Windows drive
+    // separator, mirroring the volume flags.
+    let (source, options) = match find_root_disk_options_separator(spec) {
+        Some(index) => (&spec[..index], Some(&spec[index + 1..])),
+        None => (spec, None),
+    };
+
+    // Path detection mirrors the positional rootfs classifier: an explicit
+    // relative/absolute prefix or a path separator means a local file.
+    let looks_like_path = source.starts_with('.')
+        || source.starts_with('/')
+        || source.starts_with('~')
+        || source.contains('/')
+        || source.contains('\\');
+    if looks_like_path {
+        let (format, fstype) = parse_root_disk_image_options(options)?;
+        return Ok(RootDiskSpec::DiskImage {
+            path: source.to_string(),
+            format,
+            fstype,
+        });
+    }
+
+    if options.is_some() {
+        anyhow::bail!(
+            "--root-disk: options after ':' are only valid for flat or a disk image path (e.g. flat:8G,clone=auto or ./scratch.qcow2:format=qcow2,fstype=ext4)"
+        );
+    }
+    let size_mib = ui::parse_size_mib(source).map_err(|err| {
+        anyhow::anyhow!(
+            "--root-disk: {err} (expected a size, tmpfs[:SIZE], flat[:SIZE][,OPTIONS], or an image path)"
+        )
+    })?;
+    Ok(RootDiskSpec::Managed { size_mib })
+}
+
+/// Parse `flat[:SIZE][,fstype=TYPE][,clone=auto|copy|reflink]`.
+fn parse_flat_root_disk_options(options: &str) -> anyhow::Result<RootDiskSpec> {
+    if options.trim().is_empty() {
+        anyhow::bail!("--root-disk: flat: requires a size or option after ':'");
+    }
+
+    let mut size_mib = None;
+    let mut fstype = None;
+    let mut clone = FlatClone::Auto;
+    let mut clone_set = false;
+    for (index, token) in options.split(',').map(str::trim).enumerate() {
+        if token.is_empty() {
+            anyhow::bail!("--root-disk: empty flat root option");
+        }
+        let option = token
+            .split_once('=')
+            .map(|(key, value)| (key.trim(), value.trim()));
+        match option {
+            Some(("fstype", value)) if !value.is_empty() => {
+                if fstype.replace(value.to_string()).is_some() {
+                    anyhow::bail!("--root-disk: duplicate fstype option");
+                }
+            }
+            Some(("clone", value)) => {
+                if clone_set {
+                    anyhow::bail!("--root-disk: duplicate clone option");
+                }
+                clone = match value {
+                    "auto" => FlatClone::Auto,
+                    "copy" => FlatClone::Copy,
+                    "reflink" => FlatClone::Reflink,
+                    other => anyhow::bail!(
+                        "--root-disk: unsupported flat clone strategy '{other}' (expected auto, copy, or reflink)"
+                    ),
+                };
+                clone_set = true;
+            }
+            None if index == 0 => {
+                size_mib = Some(ui::parse_size_mib(token).map_err(anyhow::Error::msg)?);
+            }
+            _ => anyhow::bail!(
+                "--root-disk: unknown flat option '{token}' (expected an optional leading size, fstype=..., or clone=auto|copy|reflink)"
+            ),
+        }
+    }
+
+    Ok(RootDiskSpec::Flat {
+        size_mib,
+        fstype,
+        clone,
+    })
+}
+
+/// Find the colon starting the options segment, skipping a Windows drive colon.
+fn find_root_disk_options_separator(spec: &str) -> Option<usize> {
+    spec.bytes()
+        .enumerate()
+        .find(|&(index, byte)| byte == b':' && !is_windows_drive_separator(spec, index))
+        .map(|(index, _)| index)
+}
+
+/// Parse the comma-separated options of a disk-image root disk.
+fn parse_root_disk_image_options(
+    options: Option<&str>,
+) -> anyhow::Result<(Option<DiskImageFormat>, Option<String>)> {
+    let mut format: Option<DiskImageFormat> = None;
+    let mut fstype: Option<String> = None;
+
+    let Some(options) = options else {
+        return Ok((None, None));
+    };
+    for token in options.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        match token.split_once('=') {
+            Some(("format", value)) => {
+                format = Some(match value {
+                    "raw" => DiskImageFormat::Raw,
+                    "qcow2" => DiskImageFormat::Qcow2,
+                    other => anyhow::bail!(
+                        "--root-disk: unsupported format '{other}' (expected raw or qcow2)"
+                    ),
+                });
+            }
+            Some(("fstype", value)) => fstype = Some(value.to_string()),
+            Some(("size", _)) => anyhow::bail!(
+                "--root-disk: size= is not valid for a disk image; the image file determines the size"
+            ),
+            _ => anyhow::bail!(
+                "--root-disk: unknown option '{token}' (expected format=raw|qcow2 or fstype=...)"
+            ),
+        }
+    }
+    Ok((format, fstype))
+}
+
+/// Apply creation-time rootfs patch options to the builder.
+fn apply_rootfs_patches(
+    mut builder: SandboxBuilder,
+    opts: &SandboxOpts,
+) -> anyhow::Result<SandboxBuilder> {
+    for spec in &opts.copy {
+        builder = builder.add_patch(parse_copy_arg("--copy", spec, CopyKind::Infer)?);
+    }
+    for spec in &opts.copy_file {
+        builder = builder.add_patch(parse_copy_arg("--copy-file", spec, CopyKind::File)?);
+    }
+    for spec in &opts.copy_dir {
+        builder = builder.add_patch(parse_copy_arg("--copy-dir", spec, CopyKind::Directory)?);
+    }
+    for path in &opts.mkdir {
+        validate_guest_path("--mkdir", path)?;
+        builder = builder.add_patch(Patch::Mkdir {
+            path: path.clone(),
+            mode: None,
+        });
+    }
+    for path in &opts.rm {
+        validate_guest_path("--rm", path)?;
+        builder = builder.add_patch(Patch::Remove { path: path.clone() });
+    }
+
+    Ok(builder)
+}
+
+/// Parse a CLI copy patch argument.
+fn parse_copy_arg(context: &str, spec: &str, kind: CopyKind) -> anyhow::Result<Patch> {
+    let (src, dst) = parse_patch_src_dst(context, spec)?;
+    build_copy_patch(context, src, dst, kind)
+}
+
+/// Parse `SRC:DST` into a host path and guest destination.
+fn parse_patch_src_dst(context: &str, spec: &str) -> anyhow::Result<(PathBuf, String)> {
+    let (src, dst) = split_source_guest_spec(context, spec)?;
+    if src.is_empty() {
+        anyhow::bail!("{context} source path cannot be empty");
+    }
+    validate_guest_path(context, dst)?;
+    Ok((PathBuf::from(src), dst.to_string()))
+}
+
+/// Build a copy patch, validating host path kind.
+fn build_copy_patch(
+    context: &str,
+    src: PathBuf,
+    dst: String,
+    kind: CopyKind,
+) -> anyhow::Result<Patch> {
+    let metadata = std::fs::metadata(&src)
+        .map_err(|e| anyhow::anyhow!("{context}: stat {}: {e}", src.display()))?;
+
+    match kind {
+        CopyKind::Infer if metadata.is_dir() => Ok(Patch::CopyDir {
+            src,
+            dst,
+            replace: false,
+        }),
+        CopyKind::Infer | CopyKind::File if metadata.is_file() => Ok(Patch::CopyFile {
+            src,
+            dst,
+            mode: None,
+            replace: false,
+        }),
+        CopyKind::File => anyhow::bail!("{context}: {} is not a file", src.display()),
+        CopyKind::Directory if metadata.is_dir() => Ok(Patch::CopyDir {
+            src,
+            dst,
+            replace: false,
+        }),
+        CopyKind::Directory => anyhow::bail!("{context}: {} is not a directory", src.display()),
+        CopyKind::Infer => anyhow::bail!(
+            "{context}: {} is not a regular file or directory",
+            src.display()
+        ),
+    }
+}
+
+/// Validate a guest patch path.
+fn validate_guest_path(context: &str, path: &str) -> anyhow::Result<()> {
+    if !path.starts_with('/') {
+        anyhow::bail!("{context}: guest path must be absolute: {path}");
+    }
+    if path.as_bytes().contains(&0) {
+        anyhow::bail!("{context}: guest path contains a null byte");
+    }
+    Ok(())
+}
+
+/// Parse a volume spec and apply it to the builder.
+///
+/// Accepts: `SRC:DST[:ro|rw][,noexec][,nosuid][,nodev][,follow-root-symlinks][,stat-virt=...][,host-perms=...][,uid=...,gid=...]`.
+pub fn apply_volume(builder: SandboxBuilder, spec: &str) -> anyhow::Result<SandboxBuilder> {
+    let parsed = parse_volume_mount_spec(spec)?;
+    let is_path = microsandbox_utils::looks_like_local_path_text(parsed.source);
+    let source = parsed.source.to_string();
+    let guest = parsed.guest.to_string();
+    let options = parsed.options;
+
+    // Keep SDK validation at the existing SandboxBuilder boundary. YAML uses
+    // the same configurator below but builds the individual mount immediately.
+    Ok(builder.volume(guest, move |mount| {
+        configure_volume_mount(mount, &source, is_path, options)
+    }))
+}
+
+/// Restore-only guest-path shorthand; explicit mappings retain the existing path grammar.
+pub(crate) fn parse_restore_volume(spec: &str) -> anyhow::Result<(String, MountBuilder)> {
+    if spec.starts_with('/') && !spec.contains(':') {
+        return Ok((spec.into(), MountBuilder::new(spec).captured()));
+    }
+    let parsed = parse_volume_mount_spec(spec)?;
+    let guest = parsed.guest.to_string();
+    let is_path = microsandbox_utils::looks_like_local_path_text(parsed.source);
+    let mount = configure_volume_mount(
+        MountBuilder::new(&guest),
+        parsed.source,
+        is_path,
+        parsed.options,
+    );
+    Ok((guest, mount))
+}
+
+/// Parse and materialize a bind mount with the shared `-v/--volume` options.
+///
+/// YAML strings historically treat every source as a config-relative bind path,
+/// including bare values such as `src`. Reuse the option grammar and builder
+/// configurator without inheriting `-v`'s bare-name named-volume inference.
+pub(crate) fn materialize_bind_mount(spec: &str) -> anyhow::Result<VolumeMount> {
+    let parsed = parse_volume_mount_spec(spec)?;
+    configure_volume_mount(
+        MountBuilder::new(parsed.guest),
+        parsed.source,
+        true,
+        parsed.options,
+    )
+    .build()
+    .map_err(Into::into)
+}
+
+/// Parse the generic bind-or-named volume syntax shared by CLI and YAML.
+fn parse_volume_mount_spec(spec: &str) -> anyhow::Result<ParsedCliMountSpec<'_>> {
+    parse_cli_mount_spec(
+        "volume",
+        spec,
+        CliMountOptionSupport {
+            policies: true,
+            quota: true,
+            owner: true,
+            ..CliMountOptionSupport::default()
+        },
+    )
+}
+
+/// Apply a parsed generic volume source and its common options to a mount.
+fn configure_volume_mount(
+    mount: MountBuilder,
+    source: &str,
+    is_path: bool,
+    mut options: CliMountOptions,
+) -> MountBuilder {
+    let mount = if is_path {
+        mount.bind(source)
+    } else {
+        // Named-volume quotas belong to the named sub-builder, unlike bind
+        // quotas which are applied by `apply_common_mount_options` below.
+        let quota_mib = options.quota_mib.take();
+        mount.named_with(source, |mut volume| {
+            volume = volume.ensure_exists();
+            if let Some(quota_mib) = quota_mib {
+                volume = volume.quota(quota_mib);
+            }
+            volume
+        })
+    };
+
+    apply_common_mount_options(mount, options)
+}
+
+/// Validate the public `-v/--volume` syntax without retaining a builder.
+pub fn validate_volume_spec(spec: &str) -> anyhow::Result<()> {
+    apply_volume(SandboxBuilder::new("__msb_volume_validation__"), spec).map(|_| ())
+}
+
+/// Validate an explicit `--mount-dir` syntax without retaining a builder.
+pub fn validate_mount_dir_spec(spec: &str) -> anyhow::Result<()> {
+    apply_explicit_dir_mount(SandboxBuilder::new("__msb_mount_dir_validation__"), spec).map(|_| ())
+}
+
+/// Validate an explicit `--mount-file` syntax without retaining a builder.
+pub fn validate_mount_file_spec(spec: &str) -> anyhow::Result<()> {
+    apply_explicit_file_mount(SandboxBuilder::new("__msb_mount_file_validation__"), spec)
+        .map(|_| ())
+}
+
+/// Validate an explicit `--mount-disk` syntax without retaining a builder.
+pub fn validate_mount_disk_spec(spec: &str) -> anyhow::Result<()> {
+    apply_explicit_disk_mount(SandboxBuilder::new("__msb_mount_disk_validation__"), spec)
+        .map(|_| ())
+}
+
+/// Validate an explicit `--mount-named` syntax without retaining a builder.
+pub fn validate_mount_named_spec(spec: &str) -> anyhow::Result<()> {
+    apply_explicit_named_mount(SandboxBuilder::new("__msb_mount_named_validation__"), spec)
+        .map(|_| ())
+}
+
+/// Apply a `--mount-dir` spec to the builder.
+pub fn apply_explicit_dir_mount(
+    builder: SandboxBuilder,
+    spec: &str,
+) -> anyhow::Result<SandboxBuilder> {
+    let parsed = parse_cli_mount_spec(
+        "mount-dir",
+        spec,
+        CliMountOptionSupport {
+            policies: true,
+            quota: true,
+            owner: true,
+            ..CliMountOptionSupport::default()
+        },
+    )?;
+    ensure_host_kind("mount-dir", parsed.source, HostPathKind::Directory)?;
+
+    let source = parsed.source.to_string();
+    let guest = parsed.guest.to_string();
+    let options = parsed.options;
+    Ok(builder.volume(guest, move |m| {
+        apply_common_mount_options(m.bind(&source), options)
+    }))
+}
+
+/// Apply a `--mount-file` spec to the builder.
+pub fn apply_explicit_file_mount(
+    builder: SandboxBuilder,
+    spec: &str,
+) -> anyhow::Result<SandboxBuilder> {
+    let parsed = parse_cli_mount_spec(
+        "mount-file",
+        spec,
+        CliMountOptionSupport {
+            policies: true,
+            quota: true,
+            owner: true,
+            ..CliMountOptionSupport::default()
+        },
+    )?;
+    ensure_host_kind("mount-file", parsed.source, HostPathKind::File)?;
+
+    let source = parsed.source.to_string();
+    let guest = parsed.guest.to_string();
+    let options = parsed.options;
+    Ok(builder.volume(guest, move |m| {
+        apply_common_mount_options(m.bind(&source), options)
+    }))
+}
+
+/// Apply a `--mount-disk` spec to the builder.
+pub fn apply_explicit_disk_mount(
+    builder: SandboxBuilder,
+    spec: &str,
+) -> anyhow::Result<SandboxBuilder> {
+    let parsed = parse_cli_mount_spec(
+        "mount-disk",
+        spec,
+        CliMountOptionSupport {
+            fstype: true,
+            format: true,
+            ..CliMountOptionSupport::default()
+        },
+    )?;
+
+    let source = parsed.source.to_string();
+    let guest = parsed.guest.to_string();
+    let options = parsed.options;
+    Ok(builder.volume(guest, move |mut m| {
+        m = m.disk(&source);
+        if let Some(format) = options.format {
+            m = m.format(format);
+        }
+        if let Some(fstype) = options.fstype.as_deref() {
+            m = m.fstype(fstype);
+        }
+        apply_common_mount_options(m, options)
+    }))
+}
+
+/// Apply a `--mount-named` spec to the builder.
+pub fn apply_explicit_named_mount(
+    builder: SandboxBuilder,
+    spec: &str,
+) -> anyhow::Result<SandboxBuilder> {
+    let parsed = parse_cli_mount_spec(
+        "mount-named",
+        spec,
+        CliMountOptionSupport {
+            policies: true,
+            size: true,
+            quota: true,
+            named_kind: true,
+            owner: true,
+            ..CliMountOptionSupport::default()
+        },
+    )?;
+    if microsandbox_utils::looks_like_local_path_text(parsed.source) {
+        anyhow::bail!(
+            "mount-named source must be a volume name, not a host path: {}",
+            parsed.source
+        );
+    }
+    if parsed.options.size_mib.is_some()
+        && !matches!(parsed.options.named_kind, Some(VolumeKind::Disk))
+    {
+        anyhow::bail!("mount-named option `size` requires kind=disk");
+    }
+    if matches!(parsed.options.named_kind, Some(VolumeKind::Disk))
+        && parsed.options.size_mib.is_none()
+    {
+        anyhow::bail!("mount-named kind=disk requires size=...");
+    }
+    if matches!(parsed.options.named_kind, Some(VolumeKind::Disk))
+        && parsed.options.quota_mib.is_some()
+    {
+        anyhow::bail!("mount-named kind=disk does not support quota=...");
+    }
+    if matches!(parsed.options.named_kind, Some(VolumeKind::Disk))
+        && (parsed.options.stat_virtualization.is_some()
+            || parsed.options.host_permissions.is_some()
+            || parsed.options.override_uid.is_some())
+    {
+        anyhow::bail!(
+            "mount-named kind=disk does not support stat-virt=..., host-perms=..., or uid/gid"
+        );
+    }
+
+    let source = parsed.source.to_string();
+    let guest = parsed.guest.to_string();
+    let options = parsed.options;
+    Ok(builder.volume(guest, move |m| {
+        let mount = m.named_with(&source, |mut v| {
+            v = v.ensure_exists();
+            if let Some(kind) = options.named_kind {
+                v = match kind {
+                    VolumeKind::Directory => v.directory(),
+                    VolumeKind::Disk => v.disk(),
+                };
+            }
+            if let Some(size_mib) = options.size_mib {
+                v = v.size(size_mib);
+            }
+            if let Some(quota_mib) = options.quota_mib {
+                v = v.quota(quota_mib);
+            }
+            v
+        });
+        let mut common_options = options;
+        common_options.quota_mib = None;
+        apply_common_mount_options(mount, common_options)
+    }))
+}
+
+/// Apply an unnamed private directory or disk mount.
+pub fn apply_owned_mount(builder: SandboxBuilder, spec: &str) -> anyhow::Result<SandboxBuilder> {
+    let (guest, mount) = owned_mount_from_spec(spec)?;
+    Ok(builder.volume(guest, move |_| mount))
+}
+
+/// Validate ownership options before `install` persists a runnable alias.
+pub fn validate_mount_owned_spec(spec: &str) -> anyhow::Result<()> {
+    let (_, builder) = owned_mount_from_spec(spec)?;
+    let mut mount = builder.build()?;
+    microsandbox_types::canonicalize_volume_mounts(std::slice::from_mut(&mut mount))?;
+    Ok(())
+}
+
+fn owned_mount_from_spec(spec: &str) -> anyhow::Result<(String, MountBuilder)> {
+    let (guest, text) = match spec.split_once(':') {
+        Some((guest, options)) => (guest, Some(options)),
+        None => (spec, None),
+    };
+    if !guest.starts_with('/') || guest.contains(',') {
+        anyhow::bail!("mount-owned must be an absolute guest path with optional :options");
+    }
+    let options = parse_cli_mount_options(
+        text,
+        CliMountOptionSupport {
+            policies: true,
+            size: true,
+            quota: true,
+            named_kind: true,
+            owner: true,
+            ..Default::default()
+        },
+    )?;
+    if options.follow_root_symlinks {
+        anyhow::bail!("mount-owned does not accept follow-root-symlinks");
+    }
+    // Keep storage options in the owned sub-builder; applying .size() to the
+    // outer mount builder would accidentally select tmpfs-only semantics.
+    let mount = MountBuilder::new(guest).owned_with(|mut volume| {
+        if options.named_kind == Some(VolumeKind::Disk) {
+            volume = volume.disk();
+        }
+        if let Some(size) = options.size_mib {
+            volume = volume.size(size);
+        }
+        if let Some(quota) = options.quota_mib {
+            volume = volume.quota(quota);
+        }
+        volume
+    });
+    let mut common = options;
+    common.quota_mib = None;
+    Ok((guest.to_owned(), apply_common_mount_options(mount, common)))
+}
+
+/// Apply common read/mount behavior options to a mount builder.
+fn apply_common_mount_options(mut mount: MountBuilder, options: CliMountOptions) -> MountBuilder {
+    if options.readonly {
+        mount = mount.readonly();
+    }
+    if options.noexec {
+        mount = mount.noexec();
+    }
+    if options.nosuid {
+        mount = mount.nosuid();
+    }
+    if options.nodev {
+        mount = mount.nodev();
+    }
+    if options.follow_root_symlinks {
+        mount = mount.follow_root_symlinks(true);
+    }
+    if let Some(sv) = options.stat_virtualization {
+        mount = mount.stat_virtualization(sv);
+    }
+    if let Some(hp) = options.host_permissions {
+        mount = mount.host_permissions(hp);
+    }
+    if let Some(quota) = options.quota_mib {
+        mount = mount.quota(quota);
+    }
+    if let (Some(uid), Some(gid)) = (options.override_uid, options.override_gid) {
+        mount = mount.owner(uid, gid);
+    }
+    mount
+}
+
+/// Parse `SOURCE:DEST[:OPTIONS]` with mount-kind-specific option support.
+fn parse_cli_mount_spec<'a>(
+    context: &str,
+    spec: &'a str,
+    support: CliMountOptionSupport,
+) -> anyhow::Result<ParsedCliMountSpec<'a>> {
+    let (source, guest_and_opts) = split_source_guest_spec(context, spec)?;
+
+    if source.is_empty() {
+        anyhow::bail!("{context} source must not be empty");
+    }
+
+    let (guest, opts) = match guest_and_opts.split_once(':') {
+        Some((g, o)) => (g, Some(o)),
+        None => {
+            if guest_and_opts.contains(',') {
+                let suggestion = guest_and_opts
+                    .split_once(',')
+                    .map(|(guest, opts)| format!("{source}:{guest}:{opts}"))
+                    .unwrap_or_else(|| format!("{source}:{guest_and_opts}:ro"));
+                anyhow::bail!(
+                    "{context} options must use source:guest:options syntax, \
+                     for example {suggestion}"
+                );
+            }
+            (guest_and_opts, None)
+        }
+    };
+
+    if guest.is_empty() {
+        anyhow::bail!("{context} guest path must not be empty");
+    }
+
+    Ok(ParsedCliMountSpec {
+        source,
+        guest,
+        options: parse_cli_mount_options(opts, support)?,
+    })
+}
+
+/// Split a `SOURCE:/guest[:options]` value without mistaking `C:\...` for the separator.
+fn split_source_guest_spec<'a>(context: &str, spec: &'a str) -> anyhow::Result<(&'a str, &'a str)> {
+    let separator = find_guest_path_separator(spec)
+        .ok_or_else(|| anyhow::anyhow!("{context} must be in format source:/guest[:options]"))?;
+    Ok((&spec[..separator], &spec[separator + 1..]))
+}
+
+/// Find the separator colon immediately before an absolute guest path.
+fn find_guest_path_separator(spec: &str) -> Option<usize> {
+    for (index, byte) in spec.bytes().enumerate() {
+        if byte != b':' {
+            continue;
+        }
+        if is_windows_drive_separator(spec, index) {
+            continue;
+        }
+        if spec[index + 1..].starts_with('/') {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Return true when `index` is the drive colon in a Windows path.
+fn is_windows_drive_separator(spec: &str, index: usize) -> bool {
+    #[cfg(windows)]
+    {
+        microsandbox_utils::is_windows_drive_separator_at(spec, index)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (spec, index);
+        false
+    }
+}
+
+/// Parse public comma-separated mount options.
+fn parse_cli_mount_options(
+    opts: Option<&str>,
+    support: CliMountOptionSupport,
+) -> anyhow::Result<CliMountOptions> {
+    use microsandbox::sandbox::{HostPermissions, StatVirtualization};
+
+    let mut parsed = CliMountOptions::default();
+    let mut seen_access = false;
+    let mut seen_noexec = false;
+    let mut seen_nosuid = false;
+    let mut seen_nodev = false;
+    let mut seen_follow_root = false;
+    let mut seen_stat_virt = false;
+    let mut seen_host_perms = false;
+    let mut seen_size = false;
+    let mut seen_quota = false;
+    let mut seen_named_kind = false;
+    let mut seen_fstype = false;
+    let mut seen_format = false;
+    let mut seen_uid = false;
+    let mut seen_gid = false;
+
+    let Some(opts) = opts else {
+        return Ok(parsed);
+    };
+
+    for opt in opts.split(',') {
+        let opt = opt.trim();
+        if opt.is_empty() {
+            continue;
+        }
+        match opt {
+            "ro" | "rw" => {
+                if seen_access {
+                    anyhow::bail!("mount option `ro`/`rw` specified more than once");
+                }
+                seen_access = true;
+                parsed.readonly = opt == "ro";
+            }
+            "noexec" => {
+                if seen_noexec {
+                    anyhow::bail!("mount option `noexec` specified more than once");
+                }
+                seen_noexec = true;
+                parsed.noexec = true;
+            }
+            "nosuid" => {
+                if seen_nosuid {
+                    anyhow::bail!("mount option `nosuid` specified more than once");
+                }
+                seen_nosuid = true;
+                parsed.nosuid = true;
+            }
+            "nodev" => {
+                if seen_nodev {
+                    anyhow::bail!("mount option `nodev` specified more than once");
+                }
+                seen_nodev = true;
+                parsed.nodev = true;
+            }
+            "follow-root-symlinks" if support.policies => {
+                if seen_follow_root {
+                    anyhow::bail!("mount option `follow-root-symlinks` specified more than once");
+                }
+                seen_follow_root = true;
+                parsed.follow_root_symlinks = true;
+            }
+            "suid" | "exec" | "dev" => {
+                anyhow::bail!("unsupported mount option {opt:?}");
+            }
+            _ => {
+                let (key, value) = opt.split_once('=').ok_or_else(|| {
+                    anyhow::anyhow!("mount option {opt:?} must be a flag or key=value")
+                })?;
+                match key {
+                    "stat-virt" if support.policies => {
+                        if seen_stat_virt {
+                            anyhow::bail!("mount option `stat-virt` specified more than once");
+                        }
+                        seen_stat_virt = true;
+                        parsed.stat_virtualization = Some(match value {
+                            "strict" => StatVirtualization::Strict,
+                            "relaxed" => StatVirtualization::Relaxed,
+                            "off" => StatVirtualization::Off,
+                            other => anyhow::bail!(
+                                "invalid stat-virt {other:?} (expected strict|relaxed|off)"
+                            ),
+                        });
+                    }
+                    "host-perms" if support.policies => {
+                        if seen_host_perms {
+                            anyhow::bail!("mount option `host-perms` specified more than once");
+                        }
+                        seen_host_perms = true;
+                        parsed.host_permissions = Some(match value {
+                            "private" => HostPermissions::Private,
+                            "mirror" => HostPermissions::Mirror,
+                            other => anyhow::bail!(
+                                "invalid host-perms {other:?} (expected private|mirror)"
+                            ),
+                        });
+                    }
+                    "size" if support.size => {
+                        if seen_size {
+                            anyhow::bail!("mount option `size` specified more than once");
+                        }
+                        seen_size = true;
+                        parsed.size_mib =
+                            Some(ui::parse_size_mib(value).map_err(anyhow::Error::msg)?);
+                    }
+                    "quota" if support.quota => {
+                        if seen_quota {
+                            anyhow::bail!("mount option `quota` specified more than once");
+                        }
+                        seen_quota = true;
+                        parsed.quota_mib =
+                            Some(ui::parse_size_mib(value).map_err(anyhow::Error::msg)?);
+                    }
+                    "kind" if support.named_kind => {
+                        if seen_named_kind {
+                            anyhow::bail!("mount option `kind` specified more than once");
+                        }
+                        seen_named_kind = true;
+                        parsed.named_kind = Some(match value {
+                            "dir" | "directory" => VolumeKind::Directory,
+                            "disk" => VolumeKind::Disk,
+                            other => anyhow::bail!(
+                                "invalid named volume kind {other:?} (expected dir|disk)"
+                            ),
+                        });
+                    }
+                    "fstype" if support.fstype => {
+                        if seen_fstype {
+                            anyhow::bail!("mount option `fstype` specified more than once");
+                        }
+                        seen_fstype = true;
+                        validate_fstype_option(value)?;
+                        parsed.fstype = Some(value.to_string());
+                    }
+                    "format" if support.format => {
+                        if seen_format {
+                            anyhow::bail!("mount option `format` specified more than once");
+                        }
+                        seen_format = true;
+                        parsed.format = Some(value.parse::<DiskImageFormat>().map_err(|e| {
+                            anyhow::anyhow!("invalid disk image format {value:?}: {e}")
+                        })?);
+                    }
+                    "uid" if support.owner => {
+                        if seen_uid {
+                            anyhow::bail!("mount option `uid` specified more than once");
+                        }
+                        seen_uid = true;
+                        parsed.override_uid = Some(value.parse::<u32>().map_err(|_| {
+                            anyhow::anyhow!("invalid uid {value:?} (expected an unsigned integer)")
+                        })?);
+                    }
+                    "gid" if support.owner => {
+                        if seen_gid {
+                            anyhow::bail!("mount option `gid` specified more than once");
+                        }
+                        seen_gid = true;
+                        parsed.override_gid = Some(value.parse::<u32>().map_err(|_| {
+                            anyhow::anyhow!("invalid gid {value:?} (expected an unsigned integer)")
+                        })?);
+                    }
+                    "stat-virt" | "host-perms" | "size" | "quota" | "kind" | "fstype"
+                    | "format" | "uid" | "gid" => {
+                        anyhow::bail!("mount option `{key}` is not valid here");
+                    }
+                    other => anyhow::bail!("unknown mount option {other:?}"),
+                }
+            }
+        }
+    }
+
+    if parsed.override_uid.is_some() != parsed.override_gid.is_some() {
+        anyhow::bail!("mount options `uid` and `gid` must be specified together");
+    }
+
+    Ok(parsed)
+}
+
+/// Validate a disk inner filesystem option before passing it to the SDK builder.
+fn validate_fstype_option(value: &str) -> anyhow::Result<()> {
+    if value.is_empty() {
+        anyhow::bail!("mount option `fstype` must not be empty");
+    }
+    if value.chars().any(|c| matches!(c, ',' | ';' | ':' | '=')) {
+        anyhow::bail!("mount option `fstype` must not contain ',', ';', ':', or '='");
+    }
+    Ok(())
+}
+
+/// Validate that an explicit host bind source has the requested kind.
+fn ensure_host_kind(context: &str, source: &str, kind: HostPathKind) -> anyhow::Result<()> {
+    let path = Path::new(source);
+    let metadata =
+        std::fs::metadata(path).map_err(|e| anyhow::anyhow!("{context} source {source:?}: {e}"))?;
+    match kind {
+        HostPathKind::Directory if metadata.is_dir() => Ok(()),
+        HostPathKind::Directory => anyhow::bail!("{context} source is not a directory: {source}"),
+        HostPathKind::File if metadata.is_file() => Ok(()),
+        HostPathKind::File => anyhow::bail!("{context} source is not a regular file: {source}"),
+    }
+}
+
+/// Apply network-related options to the builder (requires "net" feature).
+#[cfg(feature = "net")]
+fn apply_network_opts(
+    mut builder: SandboxBuilder,
+    opts: &SandboxOpts,
+    apply_cli_network_config: bool,
+) -> anyhow::Result<SandboxBuilder> {
+    use microsandbox_network::dns::Nameserver;
+
+    use crate::net_rule::parse_rule_list;
+
+    // Port mappings.
+    for port_str in &opts.port {
+        let (bind, host, guest, udp) = parse_port_mapping(port_str)?;
+        builder = if udp {
+            builder.port_udp_bind(bind, host, guest)
+        } else {
+            builder.port_bind(bind, host, guest)
+        };
+    }
+
+    // Some callers intentionally apply only additive ports after resolving network settings.
+    if !apply_cli_network_config {
+        return Ok(builder);
+    }
+
+    // Secrets. `create` persists a host-side source reference, not the raw
+    // value: the plaintext is read from the host environment at spawn time so
+    // the durable config never stores secret material at rest.
+    let mut secret_specs: Vec<ParsedSecret> = Vec::new();
+    for secret_str in &opts.secret {
+        let parsed = parse_secret(secret_str, "create")?;
+        match secret_specs
+            .iter_mut()
+            .find(|existing| existing.env_var == parsed.env_var)
+        {
+            Some(existing) => {
+                extend_unique(&mut existing.allowed_hosts, parsed.allowed_hosts);
+                extend_unique(&mut existing.passthrough_hosts, parsed.passthrough_hosts);
+                existing.substitute_headers &= parsed.substitute_headers;
+                existing.substitute_query |= parsed.substitute_query;
+                existing.substitute_body |= parsed.substitute_body;
+            }
+            None => secret_specs.push(parsed),
+        }
+    }
+    for secret in secret_specs {
+        let env_var = secret.env_var;
+        let source = microsandbox::sandbox::SecretSource::Env {
+            var: env_var.clone(),
+        };
+        builder = builder.secret(|mut s| {
+            s = s
+                .env(&env_var)
+                .source(source)
+                .substitute_in_headers(secret.substitute_headers)
+                .substitute_in_query(secret.substitute_query)
+                .substitute_in_body(secret.substitute_body);
+            for host in secret.allowed_hosts {
+                s = allow_secret_host(s, &host);
+            }
+            for host in secret.passthrough_hosts {
+                s = s.allow_placeholder_for(host);
+            }
+            s
+        });
+    }
+
+    let proxy = opts.build_outbound_proxy()?;
+
+    // DNS, TLS, and other network configuration.
+    if opts.has_network_config() {
+        let no_dns_rebind = opts.no_dns_rebind_protection;
+        let dns_nameservers = opts
+            .dns_nameserver
+            .iter()
+            .map(|s| s.parse::<Nameserver>().map_err(anyhow::Error::from))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let dns_query_timeout_ms = opts.dns_query_timeout_ms;
+        let network_policy = opts.build_network_policy()?;
+        let replaces_configured_policy = !opts.net.is_empty()
+            || opts.no_net
+            || opts.net_default.is_some()
+            || opts.net_default_egress.is_some()
+            || opts.net_default_ingress.is_some();
+        if replaces_configured_policy {
+            if let Some(policy) = network_policy {
+                builder = builder.network(move |network| network.policy(policy));
+            }
+        } else if !opts.net_rule.is_empty() {
+            let mut rules = Vec::new();
+            for value in &opts.net_rule {
+                rules.extend(parse_rule_list(value).map_err(anyhow::Error::from)?);
+            }
+            builder = builder.prepend_network_policy_rules(rules);
+        }
+        let max_conn = opts.max_tcp_connections.or(opts.max_connections);
+        let max_udp_conn = opts.max_udp_connections;
+        let tcp_accept_queue_size = opts.tcp_accept_queue_size;
+        let ipv4_pool = opts
+            .net_ipv4_pool
+            .as_deref()
+            .map(|s| {
+                s.parse::<ipnetwork::Ipv4Network>()
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
+        let ipv6_pool = opts
+            .net_ipv6_pool
+            .as_deref()
+            .map(|s| {
+                s.parse::<ipnetwork::Ipv6Network>()
+                    .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
+        let nat64_prefixes = opts
+            .net_nat64_prefix
+            .iter()
+            .map(|s| {
+                s.parse::<ipnetwork::Ipv6Network>()
+                    .map_err(anyhow::Error::from)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let trust_host_cas = opts.trust_host_cas;
+        let net_strict = opts.net_strict;
+        let tls_intercept = opts.tls_intercept;
+        let tls_ports = opts.tls_intercept_port.clone();
+        let tls_bypass = opts.tls_bypass.clone();
+        let no_block_quic = opts.no_block_quic;
+        let intercept_ca_cert = opts.tls_intercept_ca_cert.clone();
+        let intercept_ca_key = opts.tls_intercept_ca_key.clone();
+        let upstream_ca_cert = opts.tls_upstream_ca_cert.clone();
+        let scoped_upstream_ca_cert = opts
+            .tls_upstream_ca_cert_for
+            .iter()
+            .map(|spec| parse_scoped_upstream_ca_cert(spec))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let no_verify_upstream_for = opts.tls_no_verify_upstream_for.clone();
+        let violation_action = parse_violation_action(&opts.secret_violation_action)?;
+        let egress_rate_limiter = opts.build_rate_limiter(NetworkRateLimitDirection::Egress)?;
+        let ingress_rate_limiter = opts.build_rate_limiter(NetworkRateLimitDirection::Ingress)?;
+
+        builder = builder.network(move |mut n| {
+            if no_dns_rebind || !dns_nameservers.is_empty() || dns_query_timeout_ms.is_some() {
+                n = n.dns_overlay(move |mut d| {
+                    if no_dns_rebind {
+                        d = d.rebind_protection(false);
+                    }
+                    if !dns_nameservers.is_empty() {
+                        d = d.nameservers(dns_nameservers);
+                    }
+                    if let Some(ms) = dns_query_timeout_ms {
+                        d = d.query_timeout_ms(ms);
+                    }
+                    d
+                });
+            }
+            if let Some(max) = max_conn {
+                n = n.max_tcp_connections(max);
+            }
+            if let Some(max) = max_udp_conn {
+                n = n.max_udp_connections(max);
+            }
+            if let Some(size) = tcp_accept_queue_size {
+                n = n.tcp_accept_queue_size(size);
+            }
+            if let Some(pool) = ipv4_pool {
+                n = n.ipv4_pool(pool);
+            }
+            if let Some(pool) = ipv6_pool {
+                n = n.ipv6_pool(pool);
+            }
+            for prefix in nat64_prefixes {
+                n = n.nat64_prefix(prefix);
+            }
+            if trust_host_cas {
+                n = n.trust_host_cas(true);
+            }
+            if let Some(enabled) = net_strict {
+                n = n.strict(enabled);
+            }
+            if egress_rate_limiter.is_some() || ingress_rate_limiter.is_some() {
+                n = n.rate_limiter(|mut r| {
+                    if let Some(limiter) = &egress_rate_limiter {
+                        r = r.egress(|direction| limiter.apply(direction));
+                    }
+                    if let Some(limiter) = &ingress_rate_limiter {
+                        r = r.ingress(|direction| limiter.apply(direction));
+                    }
+                    r
+                });
+            }
+            if let Some(action) = violation_action {
+                n = n.secret_violation_action(action);
+            }
+
+            // TLS configuration.
+            let has_tls = tls_intercept
+                || !tls_ports.is_empty()
+                || !tls_bypass.is_empty()
+                || no_block_quic
+                || intercept_ca_cert.is_some()
+                || intercept_ca_key.is_some()
+                || !upstream_ca_cert.is_empty()
+                || !scoped_upstream_ca_cert.is_empty()
+                || !no_verify_upstream_for.is_empty();
+
+            if has_tls {
+                let tls_ports = tls_ports.clone();
+                let tls_bypass = tls_bypass.clone();
+                let intercept_ca_cert = intercept_ca_cert.clone();
+                let intercept_ca_key = intercept_ca_key.clone();
+                let upstream_ca_cert = upstream_ca_cert.clone();
+                let scoped_upstream_ca_cert = scoped_upstream_ca_cert.clone();
+                let no_verify_upstream_for = no_verify_upstream_for.clone();
+                n = n.tls_overlay(move |mut t| {
+                    t = t.enabled(true);
+                    if !tls_ports.is_empty() {
+                        t = t.intercepted_ports(tls_ports);
+                    }
+                    for domain in &tls_bypass {
+                        t = t.bypass(domain);
+                    }
+                    if no_block_quic {
+                        t = t.block_quic(false);
+                    }
+                    if let Some(ref cert) = intercept_ca_cert {
+                        t = t.intercept_ca_cert(cert);
+                    }
+                    if let Some(ref key) = intercept_ca_key {
+                        t = t.intercept_ca_key(key);
+                    }
+                    for path in &upstream_ca_cert {
+                        t = t.upstream_ca_cert(path);
+                    }
+                    for (pattern, path) in &scoped_upstream_ca_cert {
+                        t = t.upstream_ca_cert_for(pattern, path);
+                    }
+                    for pattern in &no_verify_upstream_for {
+                        t = t.verify_upstream_for(pattern, false);
+                    }
+                    t
+                });
+            }
+
+            n
+        });
+    }
+
+    if let Some(proxy) = proxy {
+        builder = builder.proxy(|_| proxy);
+    }
+
+    Ok(builder)
+}
+
+// --- Parsing helpers ---
+
+/// Parse a duration string (e.g., "30s", "5m", "1h") into seconds.
+pub fn parse_duration_secs(s: &str) -> anyhow::Result<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix('s') {
+        Ok(n.trim().parse::<u64>()?)
+    } else if let Some(n) = s.strip_suffix('m') {
+        Ok(n.trim().parse::<u64>()? * 60)
+    } else if let Some(n) = s.strip_suffix('h') {
+        Ok(n.trim().parse::<u64>()? * 3600)
+    } else {
+        Ok(s.parse::<u64>()?)
+    }
+}
+
+/// Parse a duration string with sub-second granularity. Accepts `0`,
+/// `500ms`, `5s`, `2m`, `1h`. Bare numbers are treated as seconds for
+/// consistency with [`parse_duration_secs`].
+pub fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix("ms") {
+        Ok(std::time::Duration::from_millis(n.trim().parse::<u64>()?))
+    } else if let Some(n) = s.strip_suffix('s') {
+        Ok(std::time::Duration::from_secs(n.trim().parse::<u64>()?))
+    } else if let Some(n) = s.strip_suffix('m') {
+        Ok(std::time::Duration::from_secs(
+            n.trim().parse::<u64>()? * 60,
+        ))
+    } else if let Some(n) = s.strip_suffix('h') {
+        Ok(std::time::Duration::from_secs(
+            n.trim().parse::<u64>()? * 3600,
+        ))
+    } else {
+        Ok(std::time::Duration::from_secs(s.parse::<u64>()?))
+    }
+}
+
+/// Parsed values of one direction's `--net-{egress,ingress}-*` rate limit flags.
+#[cfg(feature = "net")]
+struct CliRateLimiter {
+    bandwidth: Option<(u64, std::time::Duration)>,
+    bandwidth_burst: Option<u64>,
+    ops: Option<(u64, std::time::Duration)>,
+    ops_burst: Option<u64>,
+}
+
+#[cfg(feature = "net")]
+impl CliRateLimiter {
+    /// Apply the parsed flags to the SDK builder, which validates the
+    /// combination (bucket sizes, bursts without buckets) at build time.
+    fn apply(
+        &self,
+        mut r: microsandbox_network::builder::RateLimiterBuilder,
+    ) -> microsandbox_network::builder::RateLimiterBuilder {
+        if let Some((size, per)) = self.bandwidth {
+            r = r.bandwidth(size, per);
+        }
+        if let Some(burst) = self.bandwidth_burst {
+            r = r.bandwidth_burst(burst);
+        }
+        if let Some((count, per)) = self.ops {
+            r = r.ops(count, per);
+        }
+        if let Some(burst) = self.ops_burst {
+            r = r.ops_burst(burst);
+        }
+        r
+    }
+}
+
+/// Parse a `VALUE/DURATION` rate spec like `1M/1s` or `1000/1s`. A bare
+/// value means per second.
+#[cfg(feature = "net")]
+fn parse_rate(
+    flag: &str,
+    spec: &str,
+    parse_value: impl Fn(&str) -> anyhow::Result<u64>,
+) -> anyhow::Result<(u64, std::time::Duration)> {
+    let (value, duration) = match spec.split_once('/') {
+        Some((value, duration)) => (
+            value,
+            parse_duration(duration).map_err(|e| anyhow::anyhow!("{flag}: {e}"))?,
+        ),
+        None => (spec, std::time::Duration::from_secs(1)),
+    };
+    let value = parse_value(value.trim()).map_err(|e| anyhow::anyhow!("{flag}: {e}"))?;
+    Ok((value, duration))
+}
+
+/// Parse a port spec:
+/// - `HOST:GUEST`
+/// - `BIND_ADDR:HOST:GUEST`
+/// - `HOST:GUEST/udp`
+/// - `BIND_ADDR:HOST:GUEST/udp`
+///
+/// IPv6 bind addresses must be bracketed, e.g. `[::]:8080:80`.
+#[cfg(feature = "net")]
+pub(crate) fn parse_port_mapping(spec: &str) -> anyhow::Result<(std::net::IpAddr, u16, u16, bool)> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let (port_part, udp) = if let Some(p) = spec.strip_suffix("/udp") {
+        (p, true)
+    } else if let Some(p) = spec.strip_suffix("/tcp") {
+        (p, false)
+    } else {
+        (spec, false)
+    };
+
+    let (bind, host_str, guest_str) = if let Some(rest) = port_part.strip_prefix('[') {
+        let (bind_str, after_bracket) = rest.split_once("]:").ok_or_else(|| {
+            anyhow::anyhow!("IPv6 port bind must be in format [ADDR]:HOST:GUEST[/udp]")
+        })?;
+        let (host_str, guest_str) = after_bracket
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("port must be in format [ADDR]:HOST:GUEST[/udp]"))?;
+        let bind = bind_str
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow::anyhow!("invalid bind address: {bind_str}"))?;
+        (bind, host_str, guest_str)
+    } else {
+        let parts: Vec<_> = port_part.split(':').collect();
+        match parts.as_slice() {
+            [host_str, guest_str] => (IpAddr::V4(Ipv4Addr::LOCALHOST), *host_str, *guest_str),
+            [bind_str, host_str, guest_str] => {
+                let bind = bind_str
+                    .parse::<IpAddr>()
+                    .map_err(|_| anyhow::anyhow!("invalid bind address: {bind_str}"))?;
+                (bind, *host_str, *guest_str)
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "port must be in format HOST:GUEST[/udp] or BIND_ADDR:HOST:GUEST[/udp]"
+                ));
+            }
+        }
+    };
+
+    let host: u16 = host_str
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid host port: {host_str}"))?;
+    let guest: u16 = guest_str
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid guest port: {guest_str}"))?;
+
+    Ok((bind, host, guest, udp))
+}
+
+/// Parse `--secret ENV[:OPTIONS]@HOST[,HOST...]` for `command`.
+///
+/// The value is NOT read here: the CLI records a host-side source reference
+/// (`{kind: env, var: ENV}`) that is resolved from the host environment when
+/// needed, so raw secret material never lands in shell history or process
+/// listings.
+///
+/// The inline `ENV=VALUE@HOST` form is rejected loudly: the shell would leak
+/// the value regardless, so the value path is SDK-only. Users are pointed at
+/// the `ENV@HOST[,HOST...]` env-var form instead.
+pub(crate) fn parse_secret(spec: &str, command: &str) -> anyhow::Result<ParsedSecret> {
+    let at_pos = spec
+        .rfind('@')
+        .ok_or_else(|| anyhow::anyhow!("secret must be in format ENV[:OPTIONS]@HOST[,HOST...]"))?;
+    let policy = &spec[..at_pos];
+    let (env_var, options) = policy
+        .split_once(':')
+        .map_or((policy, None), |(env, options)| (env, Some(options)));
+
+    if let Some((name, _)) = env_var.split_once('=') {
+        anyhow::bail!(
+            "inline secret values (`{name}=VALUE@HOST`) are not supported by `{command}`: \
+             the value would be stored in the sandbox config at rest. Export the value as a \
+             host environment variable and reference it with `{name}@HOST` instead, which \
+             is resolved from the environment at start time."
+        );
+    }
+
+    let allowed_hosts: Vec<String> = spec[at_pos + 1..]
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    if env_var.is_empty() || allowed_hosts.is_empty() {
+        anyhow::bail!("secret must be in format ENV[:OPTIONS]@HOST[,HOST...] (all parts required)");
+    }
+
+    let mut parsed = ParsedSecret {
+        env_var: env_var.to_string(),
+        allowed_hosts,
+        passthrough_hosts: Vec::new(),
+        substitute_headers: true,
+        substitute_query: false,
+        substitute_body: false,
+    };
+    if let Some(options) = options {
+        for option in split_secret_options(options)? {
+            match option.as_str() {
+                "no-headers" => parsed.substitute_headers = false,
+                "query" => parsed.substitute_query = true,
+                "body" => parsed.substitute_body = true,
+                value if value.starts_with("passthrough=") => {
+                    let hosts = value.trim_start_matches("passthrough=");
+                    let hosts = hosts
+                        .strip_prefix('[')
+                        .and_then(|value| value.strip_suffix(']'))
+                        .unwrap_or(hosts);
+                    let parsed_hosts = hosts
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|host| !host.is_empty())
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    if parsed_hosts.is_empty() {
+                        anyhow::bail!("secret passthrough requires at least one host");
+                    }
+                    extend_unique(&mut parsed.passthrough_hosts, parsed_hosts);
+                }
+                other => anyhow::bail!(
+                    "invalid secret option: {other} (expected: no-headers, query, body, passthrough=HOST, or passthrough=[HOST,...])"
+                ),
+            }
+        }
+    }
+    if !parsed.substitute_headers && !parsed.substitute_query && !parsed.substitute_body {
+        anyhow::bail!("secret must enable at least one substitution location");
+    }
+
+    Ok(parsed)
+}
+
+/// Split comma-separated secret options while retaining bracketed host lists.
+fn split_secret_options(options: &str) -> anyhow::Result<Vec<String>> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut bracketed = false;
+    for (index, ch) in options.char_indices() {
+        match ch {
+            '[' if !bracketed => bracketed = true,
+            ']' if bracketed => bracketed = false,
+            ',' if !bracketed => {
+                result.push(options[start..index].trim().to_string());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if bracketed {
+        anyhow::bail!("secret passthrough host list is missing a closing `]`");
+    }
+    result.push(options[start..].trim().to_string());
+    if result.iter().any(String::is_empty) {
+        anyhow::bail!("secret options must not be empty");
+    }
+    Ok(result)
+}
+
+fn extend_unique(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+fn allow_secret_host(
+    builder: microsandbox::sandbox::SecretBuilder,
+    host: &str,
+) -> microsandbox::sandbox::SecretBuilder {
+    match microsandbox_network::secrets::config::HostPattern::parse(host) {
+        microsandbox_network::secrets::config::HostPattern::Exact(host)
+        | microsandbox_network::secrets::config::HostPattern::Wildcard(host) => builder.allow(host),
+        microsandbox_network::secrets::config::HostPattern::Any => {
+            builder.allow_any_host_dangerous(true)
+        }
+    }
+}
+
+/// Parse a scoped upstream CA spec: `PATTERN=PATH`.
+#[cfg(feature = "net")]
+pub(crate) fn parse_scoped_upstream_ca_cert(spec: &str) -> anyhow::Result<(String, PathBuf)> {
+    let (pattern, path) = spec
+        .split_once('=')
+        .filter(|(pattern, path)| !pattern.is_empty() && !path.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("scoped upstream CA must be in format PATTERN=PATH"))?;
+
+    Ok((pattern.to_string(), PathBuf::from(path)))
+}
+
+/// Parse a violation action string.
+#[cfg(feature = "net")]
+pub(crate) fn parse_violation_action(
+    s: &Option<String>,
+) -> anyhow::Result<Option<microsandbox_network::secrets::config::SecretViolationAction>> {
+    use microsandbox_network::secrets::config::SecretViolationAction;
+    match s.as_deref() {
+        None => Ok(None),
+        Some("block") => Ok(Some(SecretViolationAction::Block)),
+        Some("block-and-log") => Ok(Some(SecretViolationAction::BlockAndLog)),
+        Some("block-and-terminate") => Ok(Some(SecretViolationAction::BlockAndTerminate)),
+        Some(other) => anyhow::bail!(
+            "invalid violation action: {other} (expected: block, block-and-log, block-and-terminate)"
+        ),
+    }
+}
+
+/// Parse a tmpfs spec: `PATH`, `PATH:SIZE`, `PATH:OPTIONS`, or `PATH:SIZE:OPTIONS`.
+fn parse_tmpfs(spec: &str) -> anyhow::Result<(String, Option<u32>, CliMountOptions)> {
+    let mut parts = spec.splitn(3, ':');
+    let path = parts.next().unwrap_or_default();
+    if path.is_empty() {
+        anyhow::bail!("tmpfs path must not be empty");
+    }
+
+    let Some(second) = parts.next() else {
+        return Ok((path.to_string(), None, CliMountOptions::default()));
+    };
+
+    let support = CliMountOptionSupport {
+        size: true,
+        ..CliMountOptionSupport::default()
+    };
+
+    let (positional_size, option_block) = match parts.next() {
+        Some(opts) => {
+            if second.is_empty() {
+                anyhow::bail!("tmpfs size must not be empty before options");
+            }
+            (
+                Some(ui::parse_size_mib(second).map_err(anyhow::Error::msg)?),
+                Some(opts),
+            )
+        }
+        None if looks_like_mount_options(second) => (None, Some(second)),
+        None => (
+            Some(ui::parse_size_mib(second).map_err(anyhow::Error::msg)?),
+            None,
+        ),
+    };
+
+    let options = parse_cli_mount_options(option_block, support)?;
+    if positional_size.is_some() && options.size_mib.is_some() {
+        anyhow::bail!("tmpfs size specified more than once");
+    }
+    let size_mib = positional_size.or(options.size_mib);
+
+    Ok((path.to_string(), size_mib, options))
+}
+
+/// Returns true when a tmpfs segment is clearly an option block, not a size.
+fn looks_like_mount_options(segment: &str) -> bool {
+    segment.contains(',')
+        || segment.contains('=')
+        || matches!(
+            segment,
+            "ro" | "rw" | "noexec" | "nosuid" | "nodev" | "suid" | "exec" | "dev"
+        )
+}
+
+fn parse_security_profile(value: &str) -> anyhow::Result<SecurityProfile> {
+    match value {
+        "default" => Ok(SecurityProfile::Default),
+        "restricted" => Ok(SecurityProfile::Restricted),
+        other => anyhow::bail!("invalid security profile {other:?}"),
+    }
+}
+
+fn parse_deployment_profile(value: &str) -> anyhow::Result<DeploymentProfile> {
+    match value {
+        "single-tenant" | "single_tenant" => Ok(DeploymentProfile::SingleTenant),
+        "multi-tenant" | "multi_tenant" => Ok(DeploymentProfile::MultiTenant),
+        other => anyhow::bail!("invalid deployment profile {other:?}"),
+    }
+}
+
+/// Parse a `NAME=BODY` spec for `--script` / `--script-raw`. Splits on
+/// the first `=` so bodies may freely contain `=`. `flag` is used in
+/// the error message.
+fn parse_script_spec(spec: &str, flag: &str) -> anyhow::Result<(String, String)> {
+    let (name, body) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("{flag} must be in format NAME=BODY"))?;
+    if name.is_empty() {
+        anyhow::bail!("script name must not be empty (NAME=BODY)");
+    }
+    Ok((name.to_string(), body.to_string()))
+}
+
+/// Reject `--shell` values that would corrupt the generated shebang
+/// line or fail to exec interactively. Whitespace (including newlines)
+/// and NUL break shebang parsing; an empty string or `/` leave no
+/// interpreter for the kernel to run.
+pub(crate) fn validate_shell(shell: &str) -> anyhow::Result<()> {
+    if shell.is_empty() {
+        anyhow::bail!("--shell must not be empty");
+    }
+    if shell.chars().any(|c| c.is_whitespace() || c == '\0') {
+        anyhow::bail!(
+            "--shell must not contain whitespace or NUL (got {shell:?}); \
+             use --script-raw or --script-path if you need a custom shebang"
+        );
+    }
+    if shell == "/" {
+        anyhow::bail!("--shell {shell:?} is not a valid interpreter");
+    }
+    Ok(())
+}
+
+/// Build the shebang line for a `--script` snippet. Absolute paths
+/// (`/bin/bash`) are used directly; bare names (`bash`) go through
+/// `/usr/bin/env`.
+fn script_shebang(shell: Option<&str>) -> String {
+    let shell = shell.unwrap_or("/bin/sh");
+    if shell.contains('/') {
+        format!("#!{shell}")
+    } else {
+        format!("#!/usr/bin/env {shell}")
+    }
+}
+
+/// Decode the small set of backslash escapes supported by `--script`.
+/// Unknown escapes (e.g. `\d`) are preserved verbatim so regexes and
+/// paths survive untouched.
+fn decode_script_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('"') => out.push('"'),
+            Some('\'') => out.push('\''),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Wrap a decoded shell snippet with the generated shebang and ensure
+/// a trailing newline so the file is well-formed.
+pub(crate) fn wrap_shell_script(shell: Option<&str>, body: &str) -> String {
+    let mut script = script_shebang(shell);
+    script.push('\n');
+    script.push_str(body);
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+    script
+}
+
+/// Parse a script-from-file spec: `NAME:PATH` and read file content.
+fn parse_script_path(spec: &str) -> anyhow::Result<(String, String)> {
+    let (name, path) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("script-path must be in format NAME:PATH"))?;
+    if name.is_empty() {
+        anyhow::bail!("script name must not be empty (NAME:PATH)");
+    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read script file '{path}': {e}"))?;
+    Ok((name.to_string(), content))
+}
+
+/// Parse a pull policy string.
+fn parse_pull_policy(s: &str) -> anyhow::Result<microsandbox::sandbox::PullPolicy> {
+    use microsandbox::sandbox::PullPolicy;
+    match s {
+        "always" => Ok(PullPolicy::Always),
+        "if-missing" => Ok(PullPolicy::IfMissing),
+        "never" => Ok(PullPolicy::Never),
+        _ => anyhow::bail!("invalid pull policy: {s} (expected: always, if-missing, never)"),
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Command resolution
+//--------------------------------------------------------------------------------------------------
+
+/// Parse a log level string.
+fn parse_log_level(s: &str) -> anyhow::Result<microsandbox::LogLevel> {
+    use microsandbox::LogLevel;
+    match s {
+        "error" => Ok(LogLevel::Error),
+        "warn" => Ok(LogLevel::Warn),
+        "info" => Ok(LogLevel::Info),
+        "debug" => Ok(LogLevel::Debug),
+        "trace" => Ok(LogLevel::Trace),
+        _ => anyhow::bail!("invalid log level: {s} (expected: error, warn, info, debug, trace)"),
+    }
+}
+
+/// Return whether this invocation should use the terminal-attached PTY path.
+pub(crate) fn use_interactive_tty(stdin_is_terminal: bool, no_tty: bool) -> bool {
+    stdin_is_terminal && !no_tty
+}
+
+/// Resolve the command to run following OCI semantics.
+///
+/// Returns `(Some(cmd), args)` or `(None, _)` when no command is available.
+///
+/// Resolution order when the user supplies no explicit command:
+/// 1. Image entrypoint [+ cmd]
+/// 2. Image cmd alone
+/// 3. `config.spec.runtime.shell` (interactive only)
+/// 4. `/bin/sh` (interactive only)
+pub fn resolve_command(
+    config: &microsandbox::sandbox::SandboxConfig,
+    user_command: Vec<String>,
+    interactive: bool,
+) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    let cmd_override = (!user_command.is_empty()).then_some(user_command.as_slice());
+    match microsandbox_types::resolve_default_command(
+        config.spec.runtime.entrypoint.as_deref(),
+        config.spec.runtime.cmd.as_deref(),
+        cmd_override,
+    ) {
+        Ok(command) => return Ok((Some(command.program), command.args)),
+        Err(microsandbox_types::CommandResolutionError::NoDefaultCommand) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    // Fall back to configured shell (or /bin/sh) in interactive mode.
+    if interactive {
+        let shell = config.spec.runtime.shell.as_deref().unwrap_or("/bin/sh");
+        return Ok((Some(shell.to_string()), vec![]));
+    }
+
+    // Non-interactive with nothing to run.
+    ui::warn("no command provided or configured; pass a command after -- in non-interactive mode");
+    Ok((None, vec![]))
+}
+
+/// Resolve the command for `msb exec`.
+///
+/// Unlike `msb run`, an explicit `msb exec SANDBOX -- CMD ...` should execute
+/// `CMD` directly. The sandbox's persisted entrypoint describes the original
+/// workload start shape; reapplying it here would turn ordinary maintenance
+/// commands like `msb exec app -- date` into `entrypoint date`.
+pub fn resolve_exec_command(
+    config: &microsandbox::sandbox::SandboxConfig,
+    user_command: Vec<String>,
+    interactive: bool,
+) -> anyhow::Result<(Option<String>, Vec<String>)> {
+    if !user_command.is_empty() {
+        let mut parts = user_command;
+        let cmd = parts.remove(0);
+        return Ok((Some(cmd), parts));
+    }
+
+    resolve_command(config, user_command, interactive)
+}
+
+/// Parse an rlimit spec: `RESOURCE=LIMIT` or `RESOURCE=SOFT:HARD`.
+pub fn parse_rlimit(
+    spec: &str,
+) -> anyhow::Result<(microsandbox::sandbox::RlimitResource, u64, u64)> {
+    use microsandbox::sandbox::RlimitResource;
+    use microsandbox_protocol::exec::ExecRlimit;
+
+    let rlimit = spec.parse::<ExecRlimit>().map_err(anyhow::Error::msg)?;
+    let resource =
+        RlimitResource::try_from(rlimit.resource.as_str()).map_err(anyhow::Error::msg)?;
+
+    Ok((resource, rlimit.soft, rlimit.hard))
+}
+
+/// Parse repeatable `--label KEY[=VALUE]` selector flags into key/value pairs.
+/// A bare `KEY` yields an empty value (a valueless marker label).
+pub fn parse_label_selectors(labels: &[String]) -> Vec<(String, String)> {
+    labels.iter().map(|s| ui::parse_label(s)).collect()
+}
+
+/// List every page of sandboxes matching repeatable `--label KEY[=VALUE]` selectors.
+pub async fn list_sandboxes(labels: &[String]) -> anyhow::Result<Vec<SandboxHandle>> {
+    let labels = parse_label_selectors(labels);
+    let mut cursor: Option<String> = None;
+    let mut sandboxes = Vec::new();
+
+    loop {
+        let page = Sandbox::list_with(|list| {
+            let list = list.limit(100).labels(labels.clone());
+            match cursor.as_ref() {
+                Some(cursor) => list.cursor(cursor.clone()),
+                None => list,
+            }
+        })
+        .await?;
+        sandboxes.extend(page.sandboxes);
+
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => return Ok(sandboxes),
+        }
+    }
+}
+
+/// Resolve the set of sandbox names a command should act on, given explicit
+/// `names` plus `--label KEY=VALUE` selectors. Label-matched sandboxes are
+/// unioned with the explicit names (order-preserving, de-duplicated). Selectors
+/// are AND-matched: a sandbox must carry every label to be selected.
+pub async fn resolve_selected_sandboxes(
+    names: &[String],
+    labels: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut resolved = Vec::new();
+
+    for name in names {
+        if seen.insert(name.clone()) {
+            resolved.push(name.clone());
+        }
+    }
+
+    if !labels.is_empty() {
+        for handle in list_sandboxes(labels).await? {
+            if seen.insert(handle.name().to_string()) {
+                resolved.push(handle.name().to_string());
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Resolve target sandboxes for a bulk command (`stop`/`start`/`remove`),
+/// applying the standard guards: error when neither names nor `--label`
+/// selectors are given, and emit a notice when selectors matched nothing.
+pub async fn resolve_bulk_targets(
+    names: &[String],
+    labels: &[String],
+    quiet: bool,
+) -> anyhow::Result<Vec<String>> {
+    if names.is_empty() && labels.is_empty() {
+        anyhow::bail!("specify one or more sandbox names or --label selectors");
+    }
+
+    let resolved = resolve_selected_sandboxes(names, labels).await?;
+    if resolved.is_empty() && !quiet {
+        ui::warn("no sandboxes matched the given labels");
+    }
+
+    Ok(resolved)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use microsandbox::sandbox::{
+        HostPermissions, MountOptions, Patch, RootfsSource, SandboxConfig, StatVirtualization,
+        VolumeMount,
+    };
+
+    use super::*;
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn net_strict_defaults_and_explicit_overrides() {
+        for (args, explicit) in [
+            (vec!["test"], None),
+            (vec!["test", "--net-strict"], Some(true)),
+            (vec!["test", "--net-strict=true"], Some(true)),
+            (vec!["test", "--net-strict=false"], Some(false)),
+        ] {
+            let matches = SandboxOpts::augment_args(Command::new("test"))
+                .try_get_matches_from(args)
+                .unwrap();
+            let opts = SandboxOpts::from_arg_matches(&matches).unwrap();
+            assert_eq!(opts.net_strict, explicit);
+            for initial in [None, Some(true), Some(false)] {
+                let mut builder = SandboxBuilder::new("test").image("alpine");
+                if let Some(enabled) = initial {
+                    builder = builder.network(|n| n.strict(enabled));
+                }
+                let config = apply_sandbox_opts(builder, &opts)
+                    .unwrap()
+                    .build()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    config.spec.network.strict,
+                    explicit.or(initial).unwrap_or(true)
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn tcp_limit_flags_are_aliases_but_mutually_exclusive() {
+        for flag in ["--max-connections", "--max-tcp-connections"] {
+            let matches = SandboxOpts::augment_args(Command::new("test"))
+                .try_get_matches_from(["test", flag, "0", "--max-udp-connections", "7"])
+                .unwrap();
+            let opts = SandboxOpts::from_arg_matches(&matches).unwrap();
+            assert_eq!(opts.max_tcp_connections.or(opts.max_connections), Some(0));
+            assert_eq!(opts.max_udp_connections, Some(7));
+        }
+        let err = SandboxOpts::augment_args(Command::new("test"))
+            .try_get_matches_from([
+                "test",
+                "--max-connections",
+                "0",
+                "--max-tcp-connections",
+                "64",
+            ])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn tcp_accept_queue_size_flag_accepts_only_the_positive_c_int_range() {
+        let parse = |value: &str| {
+            SandboxOpts::augment_args(Command::new("test")).try_get_matches_from([
+                "test",
+                "--tcp-accept-queue-size",
+                value,
+            ])
+        };
+        for value in ["1", "4096", "2147483647"] {
+            let opts = SandboxOpts::from_arg_matches(&parse(value).unwrap()).unwrap();
+            assert_eq!(opts.tcp_accept_queue_size, Some(value.parse().unwrap()));
+            assert!(opts.has_network_config());
+            assert!(opts.has_creation_flags());
+        }
+        for value in ["0", "2147483648"] {
+            assert_eq!(
+                parse(value).unwrap_err().kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{value}"
+            );
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_rate_splits_value_and_duration() {
+        let bytes = |s: &str| ui::parse_size_bytes(s).map_err(anyhow::Error::msg);
+
+        let (size, per) = parse_rate("--net-egress-bandwidth", "1M/1s", bytes).unwrap();
+        assert_eq!(size, 1024 * 1024);
+        assert_eq!(per, std::time::Duration::from_secs(1));
+
+        // A bare value means per second.
+        let (count, per) = parse_rate("--net-egress-ops", "1000", |s| {
+            s.parse::<u64>().map_err(anyhow::Error::from)
+        })
+        .unwrap();
+        assert_eq!(count, 1000);
+        assert_eq!(per, std::time::Duration::from_secs(1));
+
+        let (size, per) = parse_rate("--net-ingress-bandwidth", "512K/500ms", bytes).unwrap();
+        assert_eq!(size, 512 * 1024);
+        assert_eq!(per, std::time::Duration::from_millis(500));
+
+        let err = parse_rate("--net-egress-ops", "abc/1s", |s| {
+            s.parse::<u64>().map_err(anyhow::Error::from)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--net-egress-ops"), "unexpected error: {err}");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_rate_limiter_maps_all_four_flags() {
+        let opts = SandboxOpts {
+            net_egress_bandwidth: Some("1M/1s".into()),
+            net_egress_bandwidth_burst: Some("512K".into()),
+            net_egress_ops: Some("1000/1s".into()),
+            net_egress_ops_burst: Some(500),
+            ..Default::default()
+        };
+        let limiter = opts
+            .build_rate_limiter(NetworkRateLimitDirection::Egress)
+            .unwrap()
+            .expect("limiter should be present");
+
+        assert_eq!(
+            limiter.bandwidth,
+            Some((1024 * 1024, std::time::Duration::from_secs(1)))
+        );
+        assert_eq!(limiter.bandwidth_burst, Some(512 * 1024));
+        assert_eq!(limiter.ops, Some((1000, std::time::Duration::from_secs(1))));
+        assert_eq!(limiter.ops_burst, Some(500));
+
+        assert!(
+            SandboxOpts::default()
+                .build_rate_limiter(NetworkRateLimitDirection::Ingress)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_vsock_route_defaults_to_stream() {
+        let route = parse_vsock_route("/run/host-api.sock:5000").unwrap();
+        assert_eq!(route.0, PathBuf::from("/run/host-api.sock"));
+        assert_eq!(route.1, 5000);
+        assert_eq!(route.2, VsockSocketType::Stream);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_vsock_route_accepts_explicit_socket_types() {
+        let stream = parse_vsock_route("/run/host-api.sock:5000/stream").unwrap();
+        let dgram = parse_vsock_route("/run/events.sock:5001/dgram").unwrap();
+
+        assert_eq!(stream.2, VsockSocketType::Stream);
+        assert_eq!(dgram.2, VsockSocketType::Dgram);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_vsock_route_rejects_relative_paths_and_unknown_types() {
+        assert!(
+            parse_vsock_route("run/host-api.sock:5000")
+                .unwrap_err()
+                .to_string()
+                .contains("absolute")
+        );
+        assert!(
+            parse_vsock_route("/run/host-api.sock:5000/seqpacket")
+                .unwrap_err()
+                .to_string()
+                .contains("stream or dgram")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parse_vsock_route_accepts_named_pipe_with_default_stream() {
+        let route = parse_vsock_route(r"\\.\pipe\host-api:5000").unwrap();
+        assert_eq!(route.0, PathBuf::from(r"\\.\pipe\host-api"));
+        assert_eq!(route.1, 5000);
+        assert_eq!(route.2, VsockSocketType::Stream);
+    }
+
+    #[test]
+    fn parse_secret_returns_env_and_host_reference() {
+        // The value is NOT read here: `create` persists a source reference and
+        // the spawn resolver reads the host env at start time.
+        let secret = parse_secret("MSB_PARSE_SECRET_TOKEN@api.example.com", "create").unwrap();
+
+        assert_eq!(secret.env_var, "MSB_PARSE_SECRET_TOKEN");
+        assert_eq!(secret.allowed_hosts, vec!["api.example.com"]);
+    }
+
+    #[test]
+    fn parse_secret_accepts_multiple_hosts() {
+        let secret = parse_secret(
+            "MSB_PARSE_SECRET_TOKEN@api.example.com, *.example.org, *",
+            "create",
+        )
+        .unwrap();
+
+        assert_eq!(secret.env_var, "MSB_PARSE_SECRET_TOKEN");
+        assert_eq!(
+            secret.allowed_hosts,
+            vec!["api.example.com", "*.example.org", "*"]
+        );
+    }
+
+    #[test]
+    fn parse_secret_supports_substitution_and_passthrough_options() {
+        let secret = parse_secret(
+            "GH_TOKEN:no-headers,query,body,passthrough=api.anthropic.com,passthrough=[example.com,*.example.org]@github.com,api.github.com",
+            "create",
+        )
+        .unwrap();
+
+        assert!(!secret.substitute_headers);
+        assert!(secret.substitute_query);
+        assert!(secret.substitute_body);
+        assert_eq!(
+            secret.passthrough_hosts,
+            vec!["api.anthropic.com", "example.com", "*.example.org"]
+        );
+        assert_eq!(secret.allowed_hosts, vec!["github.com", "api.github.com"]);
+    }
+
+    #[test]
+    fn parse_secret_rejects_inline_value_syntax() {
+        for command in ["create", "modify"] {
+            let err = parse_secret("API_KEY=literal@api.example.com", command)
+                .unwrap_err()
+                .to_string();
+
+            assert!(
+                err.contains("inline secret values"),
+                "unexpected error: {err}"
+            );
+            assert!(
+                err.contains(&format!("`{command}`")),
+                "unexpected error: {err}"
+            );
+            assert!(err.contains("API_KEY@HOST"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_secret_rejects_missing_parts() {
+        assert!(parse_secret("API_KEY", "create").is_err());
+        assert!(parse_secret("@api.example.com", "create").is_err());
+        assert!(parse_secret("API_KEY@", "create").is_err());
+    }
+
+    #[cfg(feature = "net")]
+    #[tokio::test]
+    async fn apply_sandbox_opts_groups_secret_hosts_and_parses_patterns() {
+        use microsandbox_network::secrets::config::HostPattern;
+
+        let opts = SandboxOpts {
+            secret: vec![
+                "API_KEY@api.example.com,*.example.org".into(),
+                "API_KEY@*".into(),
+            ],
+            ..Default::default()
+        };
+
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let secrets = config
+            .spec
+            .network
+            .secrets
+            .expect("network secrets")
+            .secrets;
+
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].env_var, "API_KEY");
+        assert_eq!(
+            secrets[0].allowed_hosts,
+            vec![
+                HostPattern::Exact("api.example.com".into()),
+                HostPattern::Wildcard("*.example.org".into()),
+                HostPattern::Any,
+            ]
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_builds_socks4_user_id() {
+        let opts = SandboxOpts {
+            proxy: Some("socks4://127.0.0.1:1080".into()),
+            socks4_user_id: Some("sandbox".into()),
+            ..Default::default()
+        };
+
+        let proxy = opts.build_outbound_proxy().unwrap().unwrap();
+        assert_eq!(
+            proxy,
+            OutboundProxy::Socks4 {
+                address: "127.0.0.1:1080".parse().unwrap(),
+                user_id: Some("sandbox".into()),
+            }
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_builds_socks5_environment_credentials() {
+        let opts = SandboxOpts {
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+            socks5_username: Some("sandbox".into()),
+            socks5_password_env: Some("SOCKS5_PASSWORD".into()),
+            ..Default::default()
+        };
+
+        let proxy = opts.build_outbound_proxy().unwrap().unwrap();
+        let json = serde_json::to_value(proxy).unwrap();
+        assert_eq!(json["protocol"], "socks5");
+        assert_eq!(json["credentials"]["username"], "sandbox");
+        assert_eq!(json["credentials"]["password"]["kind"], "env");
+        assert_eq!(json["credentials"]["password"]["var"], "SOCKS5_PASSWORD");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_rejects_protocol_specific_auth_on_the_wrong_protocol() {
+        let socks4 = SandboxOpts {
+            proxy: Some("socks4://127.0.0.1:1080".into()),
+            socks5_username: Some("sandbox".into()),
+            socks5_password_env: Some("SOCKS5_PASSWORD".into()),
+            ..Default::default()
+        };
+        assert!(
+            socks4
+                .build_outbound_proxy()
+                .unwrap_err()
+                .to_string()
+                .contains("require a socks5:// proxy")
+        );
+
+        let socks5 = SandboxOpts {
+            proxy: Some("socks5://127.0.0.1:1080".into()),
+            socks4_user_id: Some("sandbox".into()),
+            ..Default::default()
+        };
+        assert!(
+            socks5
+                .build_outbound_proxy()
+                .unwrap_err()
+                .to_string()
+                .contains("requires a socks4:// proxy")
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn outbound_proxy_rejects_incomplete_socks5_credentials() {
+        for opts in [
+            SandboxOpts {
+                proxy: Some("socks5://127.0.0.1:1080".into()),
+                socks5_username: Some("sandbox".into()),
+                ..Default::default()
+            },
+            SandboxOpts {
+                proxy: Some("socks5://127.0.0.1:1080".into()),
+                socks5_password_env: Some("SOCKS5_PASSWORD".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(opts.build_outbound_proxy().is_err());
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_scoped_upstream_ca_cert_accepts_pattern_and_path() {
+        let (pattern, path) =
+            parse_scoped_upstream_ca_cert("*.internal=/tmp/internal-ca.pem").unwrap();
+
+        assert_eq!(pattern, "*.internal");
+        assert_eq!(path, PathBuf::from("/tmp/internal-ca.pem"));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_scoped_upstream_ca_cert_rejects_missing_separator() {
+        let err = parse_scoped_upstream_ca_cert("*.internal:/tmp/internal-ca.pem")
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(err, "scoped upstream CA must be in format PATTERN=PATH");
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn parse_violation_action_rejects_passthrough() {
+        assert!(parse_violation_action(&Some("passthrough".to_string())).is_err());
+    }
+
+    #[test]
+    fn parse_root_disk_spec_classifies_values() {
+        use microsandbox::sandbox::RootDisk;
+
+        let build = |spec: &str| {
+            parse_root_disk_spec(spec)
+                .unwrap()
+                .apply(RootDiskBuilder::default())
+                .build()
+                .unwrap()
+        };
+
+        assert_eq!(build("8G"), RootDisk::managed(8192));
+        assert_eq!(build("tmpfs"), RootDisk::Tmpfs { size_mib: None });
+        assert_eq!(build("tmpfs:2G"), RootDisk::tmpfs(2048));
+        assert_eq!(
+            build("flat"),
+            RootDisk::Flat {
+                size_mib: None,
+                fstype: None,
+                clone: FlatClone::Auto,
+            }
+        );
+        assert_eq!(
+            build("flat:8G,clone=reflink"),
+            RootDisk::Flat {
+                size_mib: Some(8192),
+                fstype: None,
+                clone: FlatClone::Reflink,
+            }
+        );
+        assert_eq!(
+            build("flat:fstype=ext4,clone=copy"),
+            RootDisk::Flat {
+                size_mib: None,
+                fstype: Some("ext4".into()),
+                clone: FlatClone::Copy,
+            }
+        );
+        assert_eq!(
+            build("flat: fstype = ext4 , clone = copy"),
+            RootDisk::Flat {
+                size_mib: None,
+                fstype: Some("ext4".into()),
+                clone: FlatClone::Copy,
+            }
+        );
+        assert_eq!(
+            build("./scratch.img"),
+            RootDisk::DiskImage {
+                path: "./scratch.img".into(),
+                format: DiskImageFormat::Raw,
+                fstype: None,
+            }
+        );
+        assert_eq!(
+            build("./scratch.qcow2:format=qcow2,fstype=ext4"),
+            RootDisk::DiskImage {
+                path: "./scratch.qcow2".into(),
+                format: DiskImageFormat::Qcow2,
+                fstype: Some("ext4".into()),
+            }
+        );
+        assert_eq!(
+            build("./scratch.img:fstype=ext4"),
+            RootDisk::DiskImage {
+                path: "./scratch.img".into(),
+                format: DiskImageFormat::Raw,
+                fstype: Some("ext4".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_root_disk_spec_rejects_invalid_combinations() {
+        let err = parse_root_disk_spec("./scratch.img:size=8G").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("the image file determines the size")
+        );
+
+        let err = parse_root_disk_spec("8G:fstype=ext4").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("only valid for flat or a disk image path")
+        );
+
+        let err = parse_root_disk_spec("./scratch.vmdk:format=vmdk").unwrap_err();
+        assert!(err.to_string().contains("unsupported format"));
+
+        let err = parse_root_disk_spec("./scratch.img:kind=tmpfs").unwrap_err();
+        assert!(err.to_string().contains("unknown option"));
+
+        assert!(parse_root_disk_spec("bogus").is_err());
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_root_disk() {
+        let opts = SandboxOpts {
+            root_disk: Some("tmpfs:512M".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        match config.spec.image {
+            RootfsSource::Oci(oci) => assert_eq!(
+                oci.root_disk,
+                Some(microsandbox::sandbox::RootDisk::tmpfs(512))
+            ),
+            other => panic!("expected Oci, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_transparent_huge_page_policy() {
+        let opts = SandboxOpts {
+            thp: Some("always".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_guest_clock_policy() {
+        for (args, expected) in [
+            (vec!["create"], None),
+            (
+                vec!["create", "--guest-clock", "sync"],
+                Some(GuestClockPolicy::Sync),
+            ),
+            (
+                vec!["create", "--guest-clock", "off"],
+                Some(GuestClockPolicy::Off),
+            ),
+        ] {
+            let matches = SandboxOpts::augment_args(Command::new("create"))
+                .try_get_matches_from(args)
+                .unwrap();
+            let opts = SandboxOpts::from_arg_matches(&matches).unwrap();
+            if expected.is_some() {
+                assert!(opts.has_creation_flags());
+            }
+
+            let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(config.spec.runtime.guest_clock, expected);
+        }
+
+        assert!(
+            SandboxOpts::augment_args(Command::new("create"))
+                .try_get_matches_from(["create", "--guest-clock", "host"])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_flat_root_disk() {
+        let opts = SandboxOpts {
+            root_disk: Some("flat:8G,fstype=ext4,clone=reflink".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        let RootfsSource::Oci(oci) = config.spec.image else {
+            panic!("expected Oci");
+        };
+        assert_eq!(
+            oci.root_disk,
+            Some(microsandbox::sandbox::RootDisk::Flat {
+                size_mib: Some(8192),
+                fstype: Some("ext4".to_string()),
+                clone: FlatClone::Reflink,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_oci_upper_size() {
+        let opts = SandboxOpts {
+            oci_upper_size: Some("8G".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        match config.spec.image {
+            RootfsSource::Oci(oci) => assert_eq!(
+                oci.root_disk,
+                Some(microsandbox::sandbox::RootDisk::managed(8192))
+            ),
+            other => panic!("expected Oci, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_security_profile() {
+        let opts = SandboxOpts {
+            security: Some("restricted".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.security_profile, SecurityProfile::Restricted);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_deployment_profile() {
+        let opts = SandboxOpts {
+            deployment_profile: Some("multi-tenant".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.spec.deployment_profile,
+            DeploymentProfile::MultiTenant
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_cpu_placement() {
+        let opts = SandboxOpts {
+            cpu_placement: Some(CpuPlacement::Spread),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(config.spec.resources.cpu_placement, CpuPlacement::Spread);
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_sets_placement_profile() {
+        let opts = SandboxOpts {
+            placement_profile: Some("latency".to_string()),
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            config.spec.resources.placement_profile.as_deref(),
+            Some("latency")
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_opts_adds_cli_rootfs_patches() {
+        let file = write_temp("config");
+        let dir = make_temp_dir("msb-patch-dir");
+
+        let opts = SandboxOpts {
+            copy_file: vec![format!("{}:/etc/app/config.toml", file.display())],
+            copy_dir: vec![format!("{}:/etc/app/certs", dir.display())],
+            mkdir: vec!["/var/cache/app".into()],
+            rm: vec!["/etc/motd".into()],
+            ..Default::default()
+        };
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            &config.spec.patches[0],
+            Patch::CopyFile { src, dst, .. }
+                if src == &file && dst == "/etc/app/config.toml"
+        ));
+        assert!(matches!(
+            &config.spec.patches[1],
+            Patch::CopyDir { src, dst, .. }
+                if src == &dir && dst == "/etc/app/certs"
+        ));
+        assert!(matches!(
+            &config.spec.patches[2],
+            Patch::Mkdir { path, .. } if path == "/var/cache/app"
+        ));
+        assert!(matches!(
+            &config.spec.patches[3],
+            Patch::Remove { path } if path == "/etc/motd"
+        ));
+
+        let _ = std::fs::remove_file(file);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    //----------------------------------------------------------------------------------------------
+    // Tests: apply_volume / -v parser
+    //----------------------------------------------------------------------------------------------
+
+    /// Apply a single `-v` spec to a fresh builder and return the resulting mount.
+    async fn build_one(spec: &str) -> VolumeMount {
+        let builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        let builder = apply_volume(builder, spec).unwrap();
+        let config = builder.build().await.unwrap();
+        config.spec.mounts.into_iter().next().unwrap()
+    }
+
+    async fn build_explicit(
+        spec: &str,
+        apply: fn(SandboxBuilder, &str) -> anyhow::Result<SandboxBuilder>,
+    ) -> VolumeMount {
+        let builder = SandboxBuilder::new("test").image("alpine");
+        let config = apply(builder, spec).unwrap().build().await.unwrap();
+        config.spec.mounts.into_iter().next().unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_bind_defaults_to_strict_private() {
+        let mount = build_one("/host:/guest").await;
+        match mount {
+            VolumeMount::Bind {
+                stat_virtualization,
+                host_permissions,
+                options,
+                ..
+            } => {
+                assert!(matches!(stat_virtualization, StatVirtualization::Strict));
+                assert!(matches!(host_permissions, HostPermissions::Private));
+                assert_eq!(options, MountOptions::default());
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_ro_flag() {
+        let mount = build_one("/host:/guest:ro").await;
+        match mount {
+            VolumeMount::Bind { options, .. } => assert!(options.readonly),
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_explicit_security_mount_flags() {
+        let mount = build_one("/host:/guest:nosuid,nodev").await;
+        match mount {
+            VolumeMount::Bind { options, .. } => {
+                assert!(!options.readonly);
+                assert!(!options.noexec);
+                assert!(options.nosuid);
+                assert!(options.nodev);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_stat_virt_relaxed() {
+        let mount = build_one("/host:/guest:ro,noexec,stat-virt=relaxed").await;
+        match mount {
+            VolumeMount::Bind {
+                stat_virtualization,
+                options,
+                ..
+            } => {
+                assert!(matches!(stat_virtualization, StatVirtualization::Relaxed));
+                assert!(options.readonly);
+                assert!(options.noexec);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_host_perms_mirror() {
+        let mount = build_one("./project:/work:host-perms=mirror").await;
+        match mount {
+            VolumeMount::Bind {
+                host_permissions, ..
+            } => {
+                assert!(matches!(host_permissions, HostPermissions::Mirror));
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_combined_policies() {
+        // Off + Mirror is rejected at build; use Relaxed + Mirror instead.
+        let mount = build_one("/mnt:/host:ro,stat-virt=relaxed,host-perms=mirror").await;
+        match mount {
+            VolumeMount::Bind {
+                stat_virtualization,
+                host_permissions,
+                options,
+                ..
+            } => {
+                assert!(matches!(stat_virtualization, StatVirtualization::Relaxed));
+                assert!(matches!(host_permissions, HostPermissions::Mirror));
+                assert!(options.readonly);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_rejects_off_plus_mirror_at_sandbox_build() {
+        // The Off+Mirror conflict surfaces at SandboxBuilder.build() time
+        // because MountBuilder.build() is deferred inside the volume closure.
+        let builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        let builder = apply_volume(builder, "/mnt:/host:stat-virt=off,host-perms=mirror")
+            .expect("apply_volume defers validation");
+        let err = builder.build().await.unwrap_err();
+        assert!(
+            err.to_string().contains("Off cannot be combined with"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_named() {
+        let mount = build_one("mycache:/data:stat-virt=relaxed").await;
+        match mount {
+            VolumeMount::Named {
+                name,
+                stat_virtualization,
+                create,
+                ..
+            } => {
+                assert_eq!(name, "mycache");
+                assert!(matches!(stat_virtualization, StatVirtualization::Relaxed));
+                assert_eq!(
+                    create.as_ref().map(|create| create.mode()),
+                    Some(microsandbox::sandbox::NamedVolumeMode::EnsureExists)
+                );
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_owner_on_bind_and_named_directory() {
+        for spec in [
+            "/host:/data:uid=4242,gid=4343",
+            "mycache:/data:uid=4242,gid=4343",
+        ] {
+            let mount = build_one(spec).await;
+            let options = match mount {
+                VolumeMount::Bind { options, .. } | VolumeMount::Named { options, .. } => options,
+                other => panic!("expected virtiofs mount, got {other:?}"),
+            };
+            assert_eq!(options.override_uid, Some(4242));
+            assert_eq!(options.override_gid, Some(4343));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_dir_mount() {
+        let dir = make_temp_dir("msb-mount-dir");
+        let spec = format!("{}:/work:ro,host-perms=mirror", dir.display());
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind {
+                host,
+                guest,
+                host_permissions,
+                options,
+                ..
+            } => {
+                assert_eq!(host, dir);
+                assert_eq!(guest, "/work");
+                assert!(options.readonly);
+                assert!(matches!(host_permissions, HostPermissions::Mirror));
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_file_mount() {
+        let file = write_temp("fixture");
+        let spec = format!("{}:/fixture:ro,noexec,quota=32M", file.display());
+        let mount = build_explicit(&spec, apply_explicit_file_mount).await;
+        match mount {
+            VolumeMount::Bind {
+                host,
+                guest,
+                options,
+                quota_mib,
+                ..
+            } => {
+                assert_eq!(host, file);
+                assert_eq!(guest, "/fixture");
+                assert!(options.readonly);
+                assert!(options.noexec);
+                assert_eq!(quota_mib, Some(32));
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_dir_mount_owner() {
+        let dir = make_temp_dir("msb-mount-dir-owner");
+        let spec = format!("{}:/work:uid=4242,gid=4242", dir.display());
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind {
+                host,
+                guest,
+                options,
+                ..
+            } => {
+                assert_eq!(host, dir);
+                assert_eq!(guest, "/work");
+                assert_eq!(options.override_uid, Some(4242));
+                assert_eq!(options.override_gid, Some(4242));
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cli_mount_options_uid_gid() {
+        let owner = CliMountOptionSupport {
+            owner: true,
+            ..CliMountOptionSupport::default()
+        };
+        let parsed = parse_cli_mount_options(Some("uid=4242,gid=4242"), owner).unwrap();
+        assert_eq!(parsed.override_uid, Some(4242));
+        assert_eq!(parsed.override_gid, Some(4242));
+        // uid and gid must come as a pair.
+        assert!(parse_cli_mount_options(Some("uid=4242"), owner).is_err());
+        assert!(parse_cli_mount_options(Some("gid=4242"), owner).is_err());
+        // Rejected where owner is unsupported (e.g. --mount-disk).
+        assert!(
+            parse_cli_mount_options(Some("uid=4242,gid=4242"), CliMountOptionSupport::default())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn test_apply_explicit_dir_mount_with_windows_drive_path() {
+        let dir = make_temp_dir("msb-mount-dir-drive");
+        let spec = format!("{}:/work:ro", dir.display());
+        let mount = build_explicit(&spec, apply_explicit_dir_mount).await;
+        match mount {
+            VolumeMount::Bind {
+                host,
+                guest,
+                options,
+                ..
+            } => {
+                assert_eq!(host, dir);
+                assert_eq!(guest, "/work");
+                assert!(options.readonly);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_parse_copy_patch_with_windows_drive_path() {
+        let file = write_temp("fixture");
+        let spec = format!("{}:/guest/fixture", file.display());
+        let (src, dst) = parse_patch_src_dst("--copy-file", &spec).unwrap();
+        assert_eq!(src, file);
+        assert_eq!(dst, "/guest/fixture");
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_disk_mount() {
+        let disk = write_temp("not a real filesystem, just validating config");
+        let spec = format!(
+            "{}:/data:format=qcow2,fstype=ext4,ro,noexec",
+            disk.display()
+        );
+        let mount = build_explicit(&spec, apply_explicit_disk_mount).await;
+        match mount {
+            VolumeMount::DiskImage {
+                host,
+                guest,
+                format,
+                fstype,
+                options,
+            } => {
+                assert_eq!(host, disk);
+                assert_eq!(guest, "/data");
+                assert_eq!(format, DiskImageFormat::Qcow2);
+                assert_eq!(fstype.as_deref(), Some("ext4"));
+                assert!(options.readonly);
+                assert!(options.noexec);
+            }
+            other => panic!("expected DiskImage, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_named_mount() {
+        let mount =
+            build_explicit("cache:/data:stat-virt=relaxed", apply_explicit_named_mount).await;
+        match mount {
+            VolumeMount::Named {
+                name,
+                guest,
+                stat_virtualization,
+                create,
+                ..
+            } => {
+                assert_eq!(name, "cache");
+                assert_eq!(guest, "/data");
+                assert!(matches!(stat_virtualization, StatVirtualization::Relaxed));
+                assert_eq!(
+                    create.as_ref().map(|create| create.mode()),
+                    Some(microsandbox::sandbox::NamedVolumeMode::EnsureExists)
+                );
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_named_mount_owner() {
+        let mount =
+            build_explicit("cache:/data:uid=4242,gid=4343", apply_explicit_named_mount).await;
+        match mount {
+            VolumeMount::Named { options, .. } => {
+                assert_eq!(options.override_uid, Some(4242));
+                assert_eq!(options.override_gid, Some(4343));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_named_mount_disk_ensure_options() {
+        let mount = build_explicit(
+            "cache-disk:/data:kind=disk,size=2G",
+            apply_explicit_named_mount,
+        )
+        .await;
+        match mount {
+            VolumeMount::Named { create, .. } => {
+                let create = create.expect("mount-named should ensure the named volume");
+                assert_eq!(
+                    create.mode(),
+                    microsandbox::sandbox::NamedVolumeMode::EnsureExists
+                );
+                assert_eq!(create.kind(), VolumeKind::Disk);
+                assert_eq!(create.capacity_mib(), Some(2048));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_mount_cli_supports_directory_and_disk_without_a_name() {
+        for (spec, disk) in [
+            ("/data:quota=512M,noexec", false),
+            ("/data:kind=disk,size=1G,ro", true),
+        ] {
+            let mount = build_explicit(spec, apply_owned_mount).await;
+            let VolumeMount::Owned {
+                guest,
+                storage,
+                options,
+                ..
+            } = mount
+            else {
+                panic!("expected owned mount")
+            };
+            assert_eq!(guest, "/data");
+            if disk {
+                assert_eq!(
+                    storage,
+                    microsandbox::sandbox::OwnedVolumeStorage::Disk { capacity_mib: 1024 }
+                );
+                assert!(options.readonly);
+            } else {
+                assert_eq!(
+                    storage,
+                    microsandbox::sandbox::OwnedVolumeStorage::Directory {
+                        quota_mib: Some(512)
+                    }
+                );
+                assert!(options.noexec);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_mount_cli_rejects_name_and_inapplicable_options() {
+        for spec in [
+            "named:/data",
+            "/data:kind=disk",
+            "/data:kind=disk,size=0",
+            "/data:size=1G",
+            "/data:kind=disk,size=1G,quota=1G",
+            "/data:fstype=xfs",
+            "/data:format=qcow2",
+            "/data:follow-root-symlinks",
+        ] {
+            let result =
+                apply_owned_mount(SandboxBuilder::new("invalid-owned").image("alpine"), spec);
+            if let Ok(builder) = result {
+                assert!(
+                    builder.build().await.is_err(),
+                    "{spec} unexpectedly accepted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_install_validation_checks_storage_and_guest_path_synchronously() {
+        for spec in [
+            "/data",
+            "/data:quota=1G,nodev",
+            "/data:kind=disk,size=1G,ro",
+        ] {
+            validate_mount_owned_spec(spec).unwrap();
+        }
+        for spec in [
+            "/",
+            "/data/..",
+            "/data\0bad",
+            "/data:kind=disk",
+            "/data:kind=disk,size=0",
+            "/data:size=1G",
+            "/data:kind=disk,size=1G,stat-virt=strict",
+            "/data:kind=disk,size=1G,quota=0",
+        ] {
+            assert!(
+                validate_mount_owned_spec(spec).is_err(),
+                "accepted {spec:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_apply_explicit_named_mount_directory_quota() {
+        let mount = build_explicit("cache:/data:quota=1G", apply_explicit_named_mount).await;
+        match mount {
+            VolumeMount::Named { create, .. } => {
+                let create = create.expect("mount-named should ensure the named volume");
+                assert_eq!(
+                    create.mode(),
+                    microsandbox::sandbox::NamedVolumeMode::EnsureExists
+                );
+                assert_eq!(create.kind(), VolumeKind::Directory);
+                assert_eq!(create.quota_mib(), Some(1024));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_apply_explicit_named_mount_disk_rejects_policy_options() {
+        let err = match apply_explicit_named_mount(
+            SandboxBuilder::new("test").image("alpine"),
+            "cache-disk:/data:kind=disk,size=2G,stat-virt=relaxed",
+        ) {
+            Ok(_) => panic!("expected mount-named disk to reject stat-virt"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("does not support stat-virt"));
+
+        let err = match apply_explicit_named_mount(
+            SandboxBuilder::new("test").image("alpine"),
+            "cache-disk:/data:kind=disk,size=2G,uid=1000,gid=1000",
+        ) {
+            Ok(_) => panic!("expected mount-named disk to reject owner"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("uid/gid"));
+
+        let err = match apply_explicit_named_mount(
+            SandboxBuilder::new("test").image("alpine"),
+            "cache-disk:/data:kind=disk,size=2G,host-perms=mirror",
+        ) {
+            Ok(_) => panic!("expected mount-named disk to reject host-perms"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("does not support stat-virt"));
+    }
+
+    #[test]
+    fn test_apply_explicit_disk_rejects_policy_option() {
+        let err = match apply_explicit_disk_mount(
+            SandboxBuilder::new("test").image("alpine"),
+            "/tmp/disk.raw:/data:stat-virt=relaxed",
+        ) {
+            Ok(_) => panic!("expected mount-disk to reject stat-virt"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("not valid here"), "got: {err}");
+    }
+
+    #[test]
+    fn test_apply_explicit_file_rejects_disk_option() {
+        let file = write_temp("fixture");
+        let spec = format!("{}:/fixture:fstype=ext4", file.display());
+        let err =
+            match apply_explicit_file_mount(SandboxBuilder::new("test").image("alpine"), &spec) {
+                Ok(_) => panic!("expected mount-file to reject fstype"),
+                Err(err) => err,
+            };
+        assert!(err.to_string().contains("not valid here"), "got: {err}");
+    }
+
+    fn expect_apply_volume_err(spec: &str) -> String {
+        let builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        match apply_volume(builder, spec) {
+            Ok(_) => panic!("expected error for spec {spec:?}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_apply_volume_rejects_unknown_stat_virt() {
+        let err = expect_apply_volume_err("/host:/guest:stat-virt=bogus");
+        assert!(err.contains("invalid stat-virt"), "got: {err}");
+    }
+
+    #[test]
+    fn test_apply_volume_rejects_unknown_host_perms() {
+        let err = expect_apply_volume_err("/host:/guest:host-perms=public");
+        assert!(err.contains("invalid host-perms"), "got: {err}");
+    }
+
+    #[test]
+    fn test_apply_volume_rejects_unknown_option_key() {
+        let err = expect_apply_volume_err("/host:/guest:bogus=1");
+        assert!(err.contains("unknown mount option"), "got: {err}");
+    }
+
+    #[test]
+    fn test_apply_volume_rejects_duplicate_stat_virt() {
+        let err = expect_apply_volume_err("/host:/guest:stat-virt=strict,stat-virt=off");
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    #[test]
+    fn test_apply_volume_rejects_legacy_comma_options() {
+        let err = expect_apply_volume_err("/host:/guest,ro");
+        assert!(err.contains("source:guest:options"), "got: {err}");
+        assert!(err.contains("/host:/guest:ro"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_volume_spec_rejects_legacy_comma_options() {
+        let err = validate_volume_spec("/host:/guest,ro").unwrap_err();
+        assert!(err.to_string().contains("source:guest:options"));
+    }
+
+    #[test]
+    fn test_apply_volume_rejects_unsupported_flags() {
+        let err = expect_apply_volume_err("/host:/guest:exec");
+        assert!(err.contains("unsupported mount option"), "got: {err}");
+    }
+
+    #[test]
+    fn test_parse_tmpfs_accepts_size_and_noexec() {
+        let (path, size, options) = parse_tmpfs("/tmp:1G:noexec").unwrap();
+        assert_eq!(path, "/tmp");
+        assert_eq!(size, Some(1024));
+        assert!(options.noexec);
+    }
+
+    #[test]
+    fn test_parse_tmpfs_accepts_keyed_size_and_flags() {
+        let (path, size, options) = parse_tmpfs("/seed:size=64,ro,noexec,nosuid,nodev").unwrap();
+        assert_eq!(path, "/seed");
+        assert_eq!(size, Some(64));
+        assert!(options.readonly);
+        assert!(options.noexec);
+        assert!(options.nosuid);
+        assert!(options.nodev);
+    }
+
+    #[tokio::test]
+    async fn test_apply_volume_rejects_comma_in_source_path() {
+        // Embedded commas in host paths could silently inject mount options
+        // through the spawn → VM wire format. The SDK rejects them at build
+        // time with a clear error; the CLI surfaces that error verbatim.
+        let builder = SandboxBuilder::new("test").image("/tmp/rootfs");
+        // apply_volume itself defers to MountBuilder which only validates at
+        // SandboxBuilder::build() — so the parse step succeeds and the
+        // rejection comes from the subsequent build.
+        let builder =
+            apply_volume(builder, "/path/with,comma:/dst").expect("apply_volume defers validation");
+        let err = builder.build().await.unwrap_err();
+        assert!(
+            err.to_string().contains("must not contain ','"),
+            "got: {err}"
+        );
+    }
+
+    /// Write a temp file with unique name, return its path.
+    fn write_temp(content: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("msb-script-test-{}-{}.sh", std::process::id(), n));
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    async fn build_volume(spec: &str) -> VolumeMount {
+        let builder = SandboxBuilder::new("test").image("alpine");
+        let config = apply_volume(builder, spec).unwrap().build().await.unwrap();
+        config.spec.mounts.into_iter().next().unwrap()
+    }
+
+    fn command_config(entrypoint: Option<&[&str]>, cmd: Option<&[&str]>) -> SandboxConfig {
+        let mut config = SandboxConfig::default();
+        config.spec.runtime.entrypoint = entrypoint.map(|items| {
+            items
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect::<Vec<_>>()
+        });
+        config.spec.runtime.cmd = cmd.map(|items| {
+            items
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect::<Vec<_>>()
+        });
+        config
+    }
+
+    // --- resolve_command / resolve_exec_command ---
+
+    #[test]
+    fn resolve_command_prepends_entrypoint_to_explicit_run_command() {
+        let config = command_config(Some(&["start"]), None);
+        let (cmd, args) =
+            resolve_command(&config, vec!["date".to_string()], false).expect("resolve command");
+
+        assert_eq!(cmd.as_deref(), Some("start"));
+        assert_eq!(args, vec!["date".to_string()]);
+    }
+
+    #[test]
+    fn resolve_command_replaces_stored_cmd_with_run_override() {
+        let config = command_config(Some(&["start", "--verbose"]), Some(&["serve", "--http"]));
+        let (cmd, args) = resolve_command(
+            &config,
+            vec!["worker".to_string(), "--once".to_string()],
+            false,
+        )
+        .expect("resolve command");
+
+        assert_eq!(cmd.as_deref(), Some("start"));
+        assert_eq!(
+            args,
+            vec![
+                "--verbose".to_string(),
+                "worker".to_string(),
+                "--once".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_exec_command_runs_explicit_command_directly() {
+        let config = command_config(Some(&["start"]), None);
+        let (cmd, args) = resolve_exec_command(&config, vec!["date".to_string()], false)
+            .expect("resolve exec command");
+
+        assert_eq!(cmd.as_deref(), Some("date"));
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn resolve_exec_command_keeps_explicit_command_args() {
+        let config = command_config(Some(&["start"]), None);
+        let (cmd, args) = resolve_exec_command(
+            &config,
+            vec!["sh".to_string(), "-lc".to_string(), "echo ok".to_string()],
+            false,
+        )
+        .expect("resolve exec command");
+
+        assert_eq!(cmd.as_deref(), Some("sh"));
+        assert_eq!(args, vec!["-lc".to_string(), "echo ok".to_string()]);
+    }
+
+    #[test]
+    fn resolve_exec_command_without_explicit_command_uses_image_defaults() {
+        let config = command_config(Some(&["start"]), Some(&["default"]));
+        let (cmd, args) =
+            resolve_exec_command(&config, Vec::new(), false).expect("resolve exec command");
+
+        assert_eq!(cmd.as_deref(), Some("start"));
+        assert_eq!(args, vec!["default".to_string()]);
+    }
+
+    // --- apply_volume ---
+
+    #[tokio::test]
+    async fn apply_volume_dot_source_is_bind_mount() {
+        match build_volume(".:/mnt").await {
+            VolumeMount::Bind { host, guest, .. } => {
+                assert_eq!(host, std::path::absolute(".").unwrap());
+                assert_eq!(guest, "/mnt");
+            }
+            other => panic!("expected bind mount, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_volume_dot_dot_source_is_bind_mount() {
+        match build_volume("..:/mnt").await {
+            VolumeMount::Bind { host, guest, .. } => {
+                assert_eq!(host, std::path::absolute("..").unwrap());
+                assert_eq!(guest, "/mnt");
+            }
+            other => panic!("expected bind mount, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_volume_plain_source_is_named_mount() {
+        match build_volume("data:/mnt").await {
+            VolumeMount::Named { name, guest, .. } => {
+                assert_eq!(name, "data");
+                assert_eq!(guest, "/mnt");
+            }
+            other => panic!("expected named mount, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_volume_rejects_path_like_named_source() {
+        let builder = SandboxBuilder::new("test").image("alpine");
+        let err = apply_volume(builder, "data/../../secrets:/mnt")
+            .unwrap()
+            .build()
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("volume name"));
+    }
+
+    // --- parse_script_spec ---
+
+    #[test]
+    fn spec_basic() {
+        let (name, body) = parse_script_spec("greet=echo hi", "script").unwrap();
+        assert_eq!(name, "greet");
+        assert_eq!(body, "echo hi");
+    }
+
+    #[test]
+    fn spec_body_may_contain_equals() {
+        let (name, body) = parse_script_spec("kv=K=V test: a=b=c", "script").unwrap();
+        assert_eq!(name, "kv");
+        assert_eq!(body, "K=V test: a=b=c");
+    }
+
+    #[test]
+    fn spec_empty_body_is_allowed() {
+        let (name, body) = parse_script_spec("noop=", "script").unwrap();
+        assert_eq!(name, "noop");
+        assert_eq!(body, "");
+    }
+
+    #[test]
+    fn spec_missing_equals_errors() {
+        let err = parse_script_spec("noequals", "script").unwrap_err();
+        assert!(err.to_string().contains("NAME=BODY"), "got: {err}");
+        assert!(err.to_string().starts_with("script "), "got: {err}");
+    }
+
+    #[test]
+    fn spec_empty_name_errors() {
+        let err = parse_script_spec("=echo hi", "script").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn spec_flag_label_propagates() {
+        let err = parse_script_spec("noequals", "script-raw").unwrap_err();
+        assert!(err.to_string().starts_with("script-raw "), "got: {err}");
+    }
+
+    // --- escape decoding / shebang / wrapping ---
+
+    #[test]
+    fn decode_known_escapes() {
+        assert_eq!(decode_script_escapes(r"a\nb"), "a\nb");
+        assert_eq!(decode_script_escapes(r"a\tb"), "a\tb");
+        assert_eq!(decode_script_escapes(r"a\rb"), "a\rb");
+        assert_eq!(decode_script_escapes(r"a\\b"), "a\\b");
+        assert_eq!(decode_script_escapes(r#"a\"b"#), "a\"b");
+        assert_eq!(decode_script_escapes(r"a\'b"), "a'b");
+    }
+
+    #[test]
+    fn decode_unknown_escapes_preserved() {
+        assert_eq!(decode_script_escapes(r"a\db"), r"a\db");
+        assert_eq!(decode_script_escapes(r"\x \y \z"), r"\x \y \z");
+    }
+
+    #[test]
+    fn decode_trailing_backslash_preserved() {
+        assert_eq!(decode_script_escapes(r"foo\"), r"foo\");
+    }
+
+    #[test]
+    fn shebang_absolute_path_used_directly() {
+        assert_eq!(script_shebang(Some("/bin/bash")), "#!/bin/bash");
+        assert_eq!(
+            script_shebang(Some("/usr/local/bin/zsh")),
+            "#!/usr/local/bin/zsh"
+        );
+    }
+
+    #[test]
+    fn shebang_bare_name_goes_through_env() {
+        assert_eq!(script_shebang(Some("bash")), "#!/usr/bin/env bash");
+        assert_eq!(script_shebang(Some("zsh")), "#!/usr/bin/env zsh");
+    }
+
+    #[test]
+    fn shebang_defaults_to_bin_sh() {
+        assert_eq!(script_shebang(None), "#!/bin/sh");
+    }
+
+    #[test]
+    fn wrap_appends_trailing_newline() {
+        assert_eq!(
+            wrap_shell_script(None, "echo hello"),
+            "#!/bin/sh\necho hello\n"
+        );
+    }
+
+    #[test]
+    fn validate_shell_rejects_bad_shapes() {
+        assert!(validate_shell("").is_err());
+        assert!(validate_shell("/").is_err());
+        assert!(validate_shell("bash -x").is_err());
+        assert!(validate_shell("bash\nrm -rf /").is_err());
+        assert!(validate_shell("bash\trm").is_err());
+        assert!(validate_shell("bash\0").is_err());
+        assert!(validate_shell(" bash").is_err());
+        assert!(validate_shell("bash ").is_err());
+    }
+
+    #[test]
+    fn validate_shell_accepts_valid_shapes() {
+        assert!(validate_shell("bash").is_ok());
+        assert!(validate_shell("sh").is_ok());
+        assert!(validate_shell("/bin/sh").is_ok());
+        assert!(validate_shell("/bin/bash").is_ok());
+        assert!(validate_shell("/usr/local/bin/zsh").is_ok());
+    }
+
+    #[test]
+    fn wrap_does_not_double_trailing_newline() {
+        assert_eq!(
+            wrap_shell_script(None, "echo hello\n"),
+            "#!/bin/sh\necho hello\n"
+        );
+    }
+
+    // --- collect_scripts (duplicate logic) ---
+
+    fn script_opts(
+        shell: Option<&str>,
+        scripts: &[String],
+        raw_scripts: &[String],
+        paths: &[String],
+    ) -> SandboxOpts {
+        SandboxOpts {
+            shell: shell.map(str::to_owned),
+            script: scripts.to_vec(),
+            script_raw: raw_scripts.to_vec(),
+            script_path: paths.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    // --- parse_port_mapping ---
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_without_bind_defaults_to_loopback() {
+        let (bind, host, guest, udp) = parse_port_mapping("8080:80").unwrap();
+        assert_eq!(bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(host, 8080);
+        assert_eq!(guest, 80);
+        assert!(!udp);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_with_explicit_loopback_stays_loopback() {
+        let (bind, host, guest, udp) = parse_port_mapping("127.0.0.1:8080:80").unwrap();
+        assert_eq!(bind, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert_eq!(host, 8080);
+        assert_eq!(guest, 80);
+        assert!(!udp);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_with_ipv4_bind() {
+        let (bind, host, guest, udp) = parse_port_mapping("0.0.0.0:8080:80/udp").unwrap();
+        assert_eq!(bind, "0.0.0.0".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(host, 8080);
+        assert_eq!(guest, 80);
+        assert!(udp);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn port_with_bracketed_ipv6_bind() {
+        let (bind, host, guest, udp) = parse_port_mapping("[::]:8080:80/tcp").unwrap();
+        assert_eq!(bind, "::".parse::<std::net::IpAddr>().unwrap());
+        assert_eq!(host, 8080);
+        assert_eq!(guest, 80);
+        assert!(!udp);
+    }
+
+    // --- parse_script_path ---
+
+    #[test]
+    fn path_basic() {
+        let p = write_temp("#!/bin/sh\necho hi\n");
+        let spec = format!("hello:{}", p.display());
+        let (name, body) = parse_script_path(&spec).unwrap();
+        assert_eq!(name, "hello");
+        assert_eq!(body, "#!/bin/sh\necho hi\n");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn path_missing_colon_errors() {
+        let err = parse_script_path("nocolons").unwrap_err();
+        assert!(err.to_string().contains("NAME:PATH"), "got: {err}");
+    }
+
+    #[test]
+    fn path_empty_name_errors() {
+        let err = parse_script_path(":/tmp/whatever").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn path_missing_file_errors() {
+        let err = parse_script_path("foo:/no/such/file-msb.sh").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("failed to read script file"), "got: {msg}");
+        assert!(msg.contains("/no/such/file-msb.sh"), "got: {msg}");
+    }
+
+    // --- collect_scripts (duplicate logic) ---
+
+    #[test]
+    fn collect_script_wraps_with_default_shebang() {
+        let scripts = vec!["start=echo hello".to_string()];
+        let out = script_opts(None, &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![("start".to_string(), "#!/bin/sh\necho hello\n".to_string())]
+        );
+    }
+
+    #[test]
+    fn collect_script_decodes_newlines_in_body() {
+        let scripts = vec![r#"start=echo hello\npython -c "print(123)""#.to_string()];
+        let out = script_opts(None, &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(
+            out[0].1,
+            "#!/bin/sh\necho hello\npython -c \"print(123)\"\n"
+        );
+    }
+
+    #[test]
+    fn collect_script_uses_absolute_shell_path() {
+        let scripts = vec!["start=echo hi".to_string()];
+        let out = script_opts(Some("/bin/bash"), &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(out[0].1, "#!/bin/bash\necho hi\n");
+    }
+
+    #[test]
+    fn collect_script_uses_env_for_bare_shell() {
+        let scripts = vec!["start=echo $BASH_VERSION".to_string()];
+        let out = script_opts(Some("bash"), &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(out[0].1, "#!/usr/bin/env bash\necho $BASH_VERSION\n");
+    }
+
+    #[test]
+    fn collect_script_raw_is_exact() {
+        let raw = vec!["start=echo hello".to_string()];
+        let out = script_opts(None, &[], &raw, &[]).collect_scripts().unwrap();
+        assert_eq!(out, vec![("start".to_string(), "echo hello".to_string())]);
+    }
+
+    #[test]
+    fn collect_script_raw_preserves_escapes_literally() {
+        let raw = vec![r"start=echo hello\nworld".to_string()];
+        let out = script_opts(None, &[], &raw, &[]).collect_scripts().unwrap();
+        assert_eq!(out[0].1, r"echo hello\nworld");
+    }
+
+    #[test]
+    fn collect_script_path_is_exact_file_contents() {
+        let p = write_temp("#!/bin/sh\necho from-file\n");
+        let paths = vec![format!("start:{}", p.display())];
+        let out = script_opts(None, &[], &[], &paths)
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(out[0].1, "#!/bin/sh\necho from-file\n");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn collect_script_preserves_unknown_escapes() {
+        let scripts = vec![r"re=grep '\d\+' file".to_string()];
+        let out = script_opts(None, &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(out[0].1, "#!/bin/sh\ngrep '\\d\\+' file\n");
+    }
+
+    #[test]
+    fn collect_script_always_ends_with_newline() {
+        let scripts = vec!["start=echo hello".to_string()];
+        let out = script_opts(None, &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap();
+        assert!(out[0].1.ends_with('\n'));
+    }
+
+    #[test]
+    fn collect_preserves_order_across_all_three_sources() {
+        let p = write_temp("from-file");
+        let scripts = vec!["a=echo a".to_string()];
+        let raw = vec!["b=echo b".to_string()];
+        let paths = vec![format!("c:{}", p.display())];
+        let out = script_opts(None, &scripts, &raw, &paths)
+            .collect_scripts()
+            .unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].0, "a");
+        assert_eq!(out[1], ("b".to_string(), "echo b".to_string()));
+        assert_eq!(out[2], ("c".to_string(), "from-file".to_string()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn collect_rejects_duplicate_within_script() {
+        let scripts = vec!["foo=echo a".to_string(), "foo=echo b".to_string()];
+        let err = script_opts(None, &scripts, &[], &[])
+            .collect_scripts()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'foo' specified more than once"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn collect_rejects_duplicate_within_path() {
+        let p = write_temp("x");
+        let paths = vec![
+            format!("foo:{}", p.display()),
+            format!("foo:{}", p.display()),
+        ];
+        let err = script_opts(None, &[], &[], &paths)
+            .collect_scripts()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'foo' specified more than once"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn collect_rejects_duplicate_across_all_three_sources() {
+        let p = write_temp("x");
+        let scripts = vec!["foo=echo a".to_string()];
+        let raw = vec!["foo=echo b".to_string()];
+        let paths = vec![format!("foo:{}", p.display())];
+
+        let err = script_opts(None, &scripts, &raw, &[])
+            .collect_scripts()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'foo' specified more than once"),
+            "script vs script-raw: {err}"
+        );
+
+        let err = script_opts(None, &scripts, &[], &paths)
+            .collect_scripts()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'foo' specified more than once"),
+            "script vs script-path: {err}"
+        );
+
+        let err = script_opts(None, &[], &raw, &paths)
+            .collect_scripts()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("'foo' specified more than once"),
+            "script-raw vs script-path: {err}"
+        );
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn collect_empty_inputs_ok() {
+        let out = script_opts(None, &[], &[], &[]).collect_scripts().unwrap();
+        assert!(out.is_empty());
+    }
+
+    // --- build_network_policy: --net-default / --no-net ---
+
+    #[cfg(feature = "net")]
+    use microsandbox_network::policy::Action;
+
+    #[cfg(feature = "net")]
+    fn network_policy_opts(
+        profiles: &[String],
+        rules: &[String],
+        no_net: bool,
+        default: Option<&str>,
+        default_egress: Option<&str>,
+        default_ingress: Option<&str>,
+    ) -> SandboxOpts {
+        SandboxOpts {
+            net: profiles.to_vec(),
+            net_rule: rules.to_vec(),
+            no_net,
+            net_default: default.map(str::to_owned),
+            net_default_egress: default_egress.map(str::to_owned),
+            net_default_ingress: default_ingress.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_no_flags_returns_none() {
+        let p = network_policy_opts(&[], &[], false, None, None, None)
+            .build_network_policy()
+            .unwrap();
+        assert!(p.is_none());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_net_default_deny_sets_both_directions() {
+        let p = network_policy_opts(&[], &[], false, Some("deny"), None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(p.default_egress, Action::Deny);
+        assert_eq!(p.default_ingress, Action::Deny);
+        assert!(p.rules.is_empty());
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_net_default_allow_sets_both_directions() {
+        let p = network_policy_opts(&[], &[], false, Some("allow"), None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(p.default_egress, Action::Allow);
+        assert_eq!(p.default_ingress, Action::Allow);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_no_net_desugars_to_deny_both() {
+        let p = network_policy_opts(&[], &[], true, None, None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(p.default_egress, Action::Deny);
+        assert_eq!(p.default_ingress, Action::Deny);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_no_net_with_allow_rule_yields_allowlist() {
+        let rules = vec!["allow@example.com".to_string()];
+        let p = network_policy_opts(&[], &rules, true, None, None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(p.default_egress, Action::Deny);
+        assert_eq!(p.default_ingress, Action::Deny);
+        assert_eq!(p.rules.len(), 1);
+        assert_eq!(p.rules[0].action, Action::Allow);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_net_default_rejects_unknown_action() {
+        let err = network_policy_opts(&[], &[], false, Some("maybe"), None, None)
+            .build_network_policy()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--net-default"),
+            "expected --net-default in error, got: {err}"
+        );
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_rule_only_uses_default_direction_actions() {
+        // Without any --net-default* flag, rules apply on top of the
+        // public profile (deny egress, allow ingress). Verifies the
+        // "rules alone keep the default direction actions" path now that the
+        // --deny-domain* flip-to-allow exception is gone.
+        let rules = vec!["allow@example.com".to_string()];
+        let p = network_policy_opts(&[], &rules, false, None, None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        let baseline = microsandbox_network::policy::NetworkPolicy::default();
+        assert_eq!(p.default_egress, baseline.default_egress);
+        assert_eq!(p.default_ingress, baseline.default_ingress);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_composes_profiles_canonically_and_deduplicates_dns() {
+        use microsandbox_network::policy::{Destination, DestinationGroup, Protocol};
+
+        let profiles = vec!["host,private".to_string(), "public,private".to_string()];
+        let p = network_policy_opts(&profiles, &[], false, None, None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(p.rules.len(), 4);
+        assert_eq!(p.rules[0].protocols, [Protocol::Udp, Protocol::Tcp]);
+        for (rule, expected) in p.rules[1..].iter().zip([
+            DestinationGroup::Public,
+            DestinationGroup::Private,
+            DestinationGroup::Host,
+        ]) {
+            assert!(matches!(rule.destination, Destination::Group(group) if group == expected));
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_places_explicit_rules_before_profile_rules() {
+        let profiles = vec!["public".to_string()];
+        let rules = vec!["deny@dns".to_string()];
+        let p = network_policy_opts(&profiles, &rules, false, None, None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(p.rules[0].action, Action::Deny);
+        assert_eq!(p.rules[1].action, Action::Allow);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn build_policy_terminal_all_and_none_reject_composition() {
+        let rules = vec!["deny@private".to_string()];
+        let all = network_policy_opts(&["all".to_string()], &rules, false, None, None, None)
+            .build_network_policy()
+            .unwrap()
+            .expect("policy");
+        assert_eq!(all.default_egress, Action::Allow);
+        assert_eq!(all.rules.len(), 1);
+
+        let err = network_policy_opts(&["none,public".to_string()], &[], false, None, None, None)
+            .build_network_policy()
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"));
+
+        for profiles in [
+            vec!["all".to_string(), "none".to_string()],
+            vec!["none,all".to_string()],
+        ] {
+            let err = network_policy_opts(&profiles, &[], false, None, None, None)
+                .build_network_policy()
+                .unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "--net terminal profiles `all` and `none` cannot be combined"
+            );
+        }
+
+        let err = network_policy_opts(
+            &["all".to_string(), "all".to_string()],
+            &[],
+            false,
+            None,
+            None,
+            None,
+        )
+        .build_network_policy()
+        .unwrap_err();
+        assert_eq!(err.to_string(), "--net `all` may only be specified once");
+    }
+}

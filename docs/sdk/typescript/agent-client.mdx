@@ -1,0 +1,405 @@
+---
+title: Agent client
+description: TypeScript SDK - Low-level agentd client reference
+keywords: ["TypeScript SDK", "TypeScript agent client", "microsandbox agent client"]
+---
+
+Low-level raw CBOR transport for communicating with `agentd` through a sandbox relay.
+
+## Constants
+
+#### <span className="msb-hn">FLAG_TERMINAL</span>
+
+```typescript
+const FLAG_TERMINAL = 0b0000_0001
+```
+
+Frame flag: this is the last message for the given correlation id. When a frame on an open stream carries this bit, no further frames will arrive for that id.
+
+#### <span className="msb-hn">FLAG_SESSION_START</span>
+
+```typescript
+const FLAG_SESSION_START = 0b0000_0010
+```
+
+Frame flag: this is the first message of a new session. Set it on the opening frame of a request/response RPC or a streaming session.
+
+#### <span className="msb-hn">FLAG_SHUTDOWN</span>
+
+```typescript
+const FLAG_SHUTDOWN = 0b0000_0100
+```
+
+Frame flag: this message requests sandbox shutdown.
+
+## AgentClient
+
+Low-level client for raw agent frames.
+
+
+#### <span className="msb-recv">AgentClient.</span><span className="msb-hn">connectSandbox()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```typescript
+static connectSandbox(name: string, opts?: AgentConnectOptions): Promise<AgentClient>
+```
+
+<Accordion title="Example">
+
+```typescript
+const client = await AgentClient.connectSandbox("dev", { timeoutMs: 5000 });
+```
+
+</Accordion>
+
+Connect to a running sandbox by name. Resolves the sandbox's relay socket path and performs the `core.ready` handshake. Sandbox names are limited to 128 UTF-8 bytes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#agentconnectoptions">AgentConnectOptions</a></div>
+    <div className="msb-param-desc">Optional connect settings, e.g. handshake timeout.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">Promise&lt;AgentClient&gt;</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient.</span><span className="msb-hn">connect()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```typescript
+static connect(path: string, opts?: AgentConnectOptions): Promise<AgentClient>
+```
+
+<Accordion title="Example">
+
+```typescript
+const path = AgentClient.socketPath("dev");
+const client = await AgentClient.connect(path);
+```
+
+</Accordion>
+
+Connect to an `agentd` relay socket by path. Use this when you already have the socket path, for example one returned by [`socketPath()`](#agentclient-socketpath).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Filesystem path of the relay socket.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>opts</code><a className="msb-type" href="#agentconnectoptions">AgentConnectOptions</a></div>
+    <div className="msb-param-desc">Optional connect settings, e.g. handshake timeout.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentclient">Promise&lt;AgentClient&gt;</a></div>
+    <div className="msb-param-desc">Connected client.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">AgentClient.</span><span className="msb-hn">socketPath()</span>
+
+<Tooltip tip="Connecting an agent client by socket path is local-only; on microsandbox cloud the SDK uses the agent WebSocket route internally."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```typescript
+static socketPath(name: string): string
+```
+
+<Accordion title="Example">
+
+```typescript
+const path = AgentClient.socketPath("dev");
+```
+
+</Accordion>
+
+Resolve a sandbox's `agentd` relay socket path **without connecting**. Returns the same path [`connectSandbox()`](#agentclient-connectsandbox) would dial, so you can talk to `agentd` over a raw byte transport (for example a transparent relay that splices bytes to and from the socket) instead of this frame client. The sandbox need not be running. Sandbox names are limited to 128 UTF-8 bytes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Sandbox name, up to 128 UTF-8 bytes.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Relay socket path.</div>
+  </div>
+</div>
+
+<p className="msb-member-group">Instance methods</p>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">request()</span>
+
+```typescript
+request(flags: number, body: Buffer): Promise<RawFrame>
+```
+
+<Accordion title="Example">
+
+```typescript
+import { encode, decode } from "cbor-x";
+import { FLAG_SESSION_START } from "microsandbox";
+
+const body = encode({ v: 1, t: "core.fs.request", p: encode({ op: { Stat: { path: "/etc" } } }) });
+const frame = await client.request(FLAG_SESSION_START, body);
+console.log(decode(frame.body));
+```
+
+</Accordion>
+
+Send one frame and await a single response frame. Use for request/response RPCs that produce exactly one terminal response (for example `FsRequest` to `FsResponse`).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">number</span></div>
+    <div className="msb-param-desc">Frame flag byte, e.g. <code>FLAG_SESSION_START</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Buffer</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#rawframe">Promise&lt;RawFrame&gt;</a></div>
+    <div className="msb-param-desc">The single response frame.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">stream()</span>
+
+```typescript
+stream(flags: number, body: Buffer): Promise<AgentStream>
+```
+
+<Accordion title="Example">
+
+```typescript
+import { FLAG_SESSION_START, FLAG_TERMINAL } from "microsandbox";
+
+const stream = await client.stream(FLAG_SESSION_START, body);
+for await (const frame of stream) {
+  if ((frame.flags & FLAG_TERMINAL) !== 0) break;
+}
+```
+
+</Accordion>
+
+Open a streaming session. The returned [`AgentStream`](#agentstream) carries the protocol correlation `id` (pass it to [`send()`](#client-send) for follow-up frames) and is also an async iterator of raw frames.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">number</span></div>
+    <div className="msb-param-desc">Frame flag byte for the opening frame, e.g. <code>FLAG_SESSION_START</code>.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Buffer</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#agentstream">Promise&lt;AgentStream&gt;</a></div>
+    <div className="msb-param-desc">Open stream of raw frames.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">send()</span>
+
+```typescript
+send(id: number, flags: number, body: Buffer): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await client.send(stream.id, 0, encode({ v: 1, t: "core.pty.stdin", p: encode({ data: "ls\n" }) }));
+```
+
+</Accordion>
+
+Send a follow-up frame on an existing correlation id (for example stdin, a signal, a resize, or data chunks on an open session). Use the `id` of the [`AgentStream`](#agentstream) returned by [`stream()`](#client-stream).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>id</code><span className="msb-type">number</span></div>
+    <div className="msb-param-desc">Correlation id of an open session.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>flags</code><span className="msb-type">number</span></div>
+    <div className="msb-param-desc">Frame flag byte.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>body</code><span className="msb-type">Buffer</span></div>
+    <div className="msb-param-desc">CBOR-encoded protocol message body.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">readyBytes()</span>
+
+```typescript
+readyBytes(): Buffer
+```
+
+<Accordion title="Example">
+
+```typescript
+import { decode } from "cbor-x";
+
+const ready = decode(client.readyBytes());
+```
+
+</Accordion>
+
+Return the cached handshake `core.ready` frame body as CBOR bytes. Captured during connect, so this is a synchronous accessor with no protocol traffic.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Buffer</span></div>
+    <div className="msb-param-desc">CBOR-encoded <code>core.ready</code> frame body.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">client.</span><span className="msb-hn">close()</span>
+
+```typescript
+close(): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await client.close();
+```
+
+</Accordion>
+
+Close the connection. Idempotent: calling it more than once is safe.
+
+## AgentStream
+
+
+<p className="msb-backref">Returned by <a href="#client-stream">stream()</a></p>
+
+An open raw agent stream. Implements `AsyncIterableIterator<RawFrame>`, so it can be driven with `for await`. The iterator ends after a frame carrying [`FLAG_TERMINAL`](#flag_terminal) or when the underlying stream is exhausted.
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">id</span>
+
+`number`
+
+Protocol correlation id; pass to [`send()`](#client-send) for follow-up frames
+
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">next()</span>
+
+```typescript
+next()
+```
+
+Pull the next frame; `done` once terminal or exhausted
+
+<p className="msb-label">Returns</p>
+
+`Promise<IteratorResult<`[`RawFrame`](#rawframe)`>>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">close()</span>
+
+```typescript
+close()
+```
+
+Release the stream handle early (idempotent)
+
+<p className="msb-label">Returns</p>
+
+`Promise<void>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">return()</span>
+
+```typescript
+return()
+```
+
+Async-iterator early-exit hook; closes the stream
+
+<p className="msb-label">Returns</p>
+
+`Promise<IteratorResult<`[`RawFrame`](#rawframe)`>>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">[Symbol.asyncIterator]()</span>
+
+```typescript
+[Symbol.asyncIterator]()
+```
+
+Returns itself so the stream is iterable
+
+<p className="msb-label">Returns</p>
+
+[`AgentStream`](#agentstream)
+
+## Types
+
+### RawFrame
+
+<p className="msb-backref">Returned by <a href="#client-request">request()</a> · iterated from <a href="#agentstream">AgentStream</a></p>
+
+A raw protocol frame. The `body` is the CBOR-encoded `Message` body (`v`, `t`, `p`) as it appeared on the wire; decode it with a CBOR library such as `cbor-x`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| id | `number` | Correlation id from the frame header |
+| flags | `number` | Frame flags (`FLAG_TERMINAL`, `FLAG_SESSION_START`, ...) |
+| body | `Buffer` | Raw CBOR-encoded body bytes |
+
+### AgentConnectOptions
+
+<p className="msb-backref">Used by <a href="#agentclient-connectsandbox">connectSandbox()</a> · <a href="#agentclient-connect">connect()</a></p>
+
+Options for connecting to an agent relay.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| timeoutMs | `number` | Handshake timeout in milliseconds. Defaults to `10_000`. |

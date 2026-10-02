@@ -1,0 +1,56 @@
+FROM rust:alpine AS builder
+
+RUN apk add --no-cache musl-dev
+
+WORKDIR /build
+
+COPY . .
+
+RUN set -eux; \
+    version="$(sed -n '/^\[workspace.package\]/,/^\[/ s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1 | tr -d '\r')"; \
+    rm -f Cargo.lock; \
+    cat > Cargo.toml <<EOF
+[workspace]
+resolver = "3"
+members = [
+    "crates/agentd",
+    "crates/protocol",
+    "packages/microsandbox-types/macros",
+    "packages/microsandbox-types/rust",
+]
+
+[workspace.package]
+authors = ["Super Rad Company <development@superrad.company>"]
+repository = "https://github.com/superradcompany/microsandbox"
+version = "$version"
+license = "Apache-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+base64 = "0.22"
+bytes = "1.9"
+chrono = { version = "0.4", features = ["serde"] }
+ciborium = "0.2"
+hex = "0.4"
+ipnetwork = { version = "0.21.0", features = ["serde"] }
+libc = "0.2"
+microsandbox-protocol = { path = "crates/protocol" }
+microsandbox-types = { path = "packages/microsandbox-types/rust" }
+microsandbox-types-macros = { path = "packages/microsandbox-types/macros" }
+nix = "0.31"
+serde = { version = "1.0", features = ["derive"] }
+serde_bytes = "0.11"
+serde_json = "1.0"
+sha2 = "0.11.0"
+strum = { version = "0.28", features = ["derive"] }
+thiserror = "2.0"
+tokio = { version = "1.52", features = ["full"] }
+ts-rs = "12.0.1"
+typed-path = "0.12"
+zeroize = { version = "1.8", features = ["derive", "serde"] }
+EOF
+
+RUN cargo build --release --manifest-path crates/agentd/Cargo.toml
+
+FROM scratch
+COPY --from=builder /build/target/release/agentd /agentd

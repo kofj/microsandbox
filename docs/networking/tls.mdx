@@ -1,0 +1,210 @@
+---
+title: TLS inspection
+sidebarTitle: TLS
+description: Inspect HTTPS traffic and manage certificate trust
+icon: "lock"
+---
+
+<Tooltip tip="TLS inspection and host CA trust are not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+TLS inspection lets microsandbox inspect HTTPS traffic. This enables URL policy checks, request logging, and secure secret injection for matching hosts.
+
+## How it works
+
+When interception is enabled, microsandbox:
+
+1. Loads an interception certificate authority, or CA.
+2. Adds that CA to the guest's trust store.
+3. Creates a certificate for each intercepted host.
+4. Opens a separate verified TLS connection to the upstream server.
+
+microsandbox stores the default CA at `~/.microsandbox/tls/ca.{crt,key}` and reuses it across local sandboxes. Delete both files to generate a new CA. Use the intercept CA certificate and key settings when sandboxes should use a CA that you provide.
+
+For new local sandboxes, relative paths to upstream CA certificates and interception CA certificate/key files are resolved when the sandbox is created and saved as absolute paths. Starting the same sandbox from another working directory does not select different TLS files. Existing saved sandboxes with relative TLS paths retain their previous resolution behavior. They remain usable without recreation, and restart does not rewrite their saved paths.
+
+## Enabling interception
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+await using sb = await Sandbox.builder("worker")
+  .image("python")
+  .network((n) => n.tls((t) =>
+    t.bypass("pinned-api.example.com").bypass("*.gov"),
+  ))
+  .create();
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .network(|n| n.tls(|t| t
+        .bypass("pinned-api.example.com")
+        .bypass("*.gov")
+    ))
+    .create()
+    .await?;
+```
+
+```python Python
+from microsandbox import Network, Sandbox, TlsConfig
+
+sb = await Sandbox.create(
+    "worker",
+    image="python",
+    network=Network(
+        tls=TlsConfig(bypass=("pinned-api.example.com", "*.gov")),
+    ),
+)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("python"),
+    m.WithNetwork(&m.NetworkConfig{
+        TLS: &m.TLSConfig{
+            Bypass: []string{"pinned-api.example.com", "*.gov"},
+        },
+    }),
+)
+```
+
+```bash CLI
+msb create python --name worker \
+  --tls-intercept \
+  --tls-bypass "pinned-api.example.com" \
+  --tls-bypass "*.gov"
+```
+</CodeGroup>
+
+## Bypass patterns
+
+Some clients trust a specific certificate or public key instead of the guest's trust store. Interception will fail for these clients.
+
+Add their hosts to the bypass list. Exact domains such as `api.example.com` and wildcards such as `*.apple.com` are supported. Bypassed traffic stays encrypted between the guest and upstream server, so content-based policy checks and secret injection do not apply.
+
+## Upstream CA trust
+
+The proxy verifies upstream certificates with the host's root store by default. You can add:
+
+- a CA trusted for every intercepted host
+- a CA trusted only for matching hosts
+- a host pattern that skips upstream verification
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+await using sb = await Sandbox.builder("agent")
+  .image("python")
+  .network((n) => n.tls((t) =>
+    t.upstreamCaCert("/etc/ssl/corp-root.pem")
+      .upstreamCaCertFor("api.internal.example.com", "./certs/api-ca.pem")
+      .verifyUpstreamFor("*.preview.internal", false),
+  ))
+  .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("agent")
+    .image("python")
+    .network(|n| n.tls(|t| t
+        .upstream_ca_cert("/etc/ssl/corp-root.pem")
+        .upstream_ca_cert_for("api.internal.example.com", "./certs/api-ca.pem")
+        .verify_upstream_for("*.preview.internal", false)
+    ))
+    .create()
+    .await?;
+```
+
+```bash CLI
+msb create python --name agent \
+  --tls-intercept \
+  --tls-upstream-ca-cert /etc/ssl/corp-root.pem \
+  --tls-upstream-ca-cert-for 'api.internal.example.com=./certs/api-ca.pem' \
+  --tls-no-verify-upstream-for '*.preview.internal'
+```
+</CodeGroup>
+
+Skipping verification is similar to using `curl -k`. Use it only for hosts you control and only when a trusted CA is not available.
+
+## Limits
+
+- Clients that pin certificates or public keys must be bypassed.
+- Bypassed traffic cannot use content-based policy checks or secret injection.
+- microsandbox does not proxy guest client certificates. Bypass hosts that require guest mTLS.
+- microsandbox does not intercept QUIC and HTTP/3 traffic.
+
+## Trusting host CAs
+
+Corporate proxies often replace server certificates with certificates signed by a company CA. The host trusts that CA, but a sandbox normally does not. Commands such as `apk update`, `pip install`, and `curl` can then fail with a certificate error.
+
+Enable host CA trust to copy trusted host roots into the guest when it starts:
+
+<CodeGroup>
+```typescript TypeScript
+await using sb = await Sandbox.builder("devbox")
+  .image("alpine")
+  .network((n) => n.trustHostCAs(true))
+  .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("devbox")
+    .image("alpine")
+    .network(|n| n.trust_host_cas(true))
+    .create()
+    .await?;
+```
+
+```python Python
+sb = await Sandbox.create(
+    "devbox",
+    image="alpine",
+    network=Network(trust_host_cas=True),
+)
+```
+
+```go Go
+trustHostCAs := true
+sb, err := m.CreateSandbox(ctx, "devbox",
+    m.WithImage("alpine"),
+    m.WithNetwork(&m.NetworkConfig{
+        TrustHostCAs: &trustHostCAs,
+    }),
+)
+```
+
+```bash CLI
+msb run alpine --trust-host-cas -- apk update
+```
+</CodeGroup>
+
+<Note>
+Host CA trust gives the guest every root certificate trusted by the host. Enable it only when you trust the host's CA store.
+</Note>
+
+## Using both
+
+TLS inspection covers configured ports, with port `443` enabled by default. TLS inspection and host CA trust solve different problems:
+
+| Feature | Covers |
+| --- | --- |
+| TLS inspection | Configured TLS ports and hosts that are not bypassed |
+| Host CA trust | Any guest connection that uses the guest's system trust store |
+
+Use both when you need HTTPS inspection and also need raw TLS connections to trust corporate certificates. Raw TLS includes bypassed hosts, custom TLS ports, and protocols such as Postgres or Redis over TLS.
+
+## Reference
+
+For exact TLS and network APIs, see [TypeScript](/sdk/typescript/networking#tlsbuilder), [Rust](/sdk/rust/networking#tlsbuilder), [Python](/sdk/python/networking#tlsconfig), or [Go](/sdk/go/networking#tlsconfig). For CLI fields and flags, see [Sandbox configuration](/cli/configuration#network) and [Sandbox commands](/cli/sandbox-commands).
+
+## Related
+
+- [DNS](/networking/dns) explains DNS policy and DNS over TLS.
+- [Proxies](/networking/outbound-proxy) explains routing outbound TCP and non-DNS UDP through an external SOCKS proxy.
+- [Network defenses](/security/network) explains SSRF protection.
+- [Secret handling](/security/secrets) explains credential injection.

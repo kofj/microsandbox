@@ -1,0 +1,102 @@
+---
+title: SSH commands
+sidebarTitle: "SSH"
+description: Connect to and serve sandboxes over SSH
+icon: "lock"
+---
+
+SSH commands expose sandbox shells, remote commands, and SFTP through the SSH protocol. For usage flows, see [SSH](/sandboxes/ssh).
+
+## msb ssh
+
+Start a native SSH client session into a sandbox. With no remote command, this opens an interactive shell. With `--`, the remaining tokens are joined into the remote shell command.
+
+```bash
+msb ssh devbox
+msb ssh devbox -- uname -a
+msb ssh --name serve -- uptime
+```
+
+| Argument | Description |
+|----------|-------------|
+| `sandbox` | Sandbox name, up to 128 UTF-8 bytes |
+| `-n`, `--name NAME` | Explicit sandbox name, up to 128 UTF-8 bytes; useful when the name collides with `serve`, `authorize`, or `help` |
+| `--inactivity-timeout DURATION` | Disconnect after this much SSH inactivity; accepts values such as `30s`, `10m`, or `1h`. Use `0` to disable |
+| `--no-inactivity-timeout` | Disable the SSH inactivity timeout |
+| `-- COMMAND...` | Remote command to run through the sandbox shell |
+
+## msb ssh authorize
+
+Add a public key to microsandbox's SSH authorization file.
+
+```bash
+msb ssh authorize --file ~/.ssh/id_ed25519.pub
+msb ssh authorize --key "ssh-ed25519 AAAA... user@host"
+cat ~/.ssh/id_ed25519.pub | msb ssh authorize --stdin
+```
+
+| Flag | Description |
+|------|-------------|
+| `--file PATH` | Read one public key from a file |
+| `--key KEY` | Read one public key from the flag value |
+| `--stdin` | Read one public key from stdin |
+
+The default authorization file is `<MSB_HOME>/ssh/authorized_keys`, or `~/.microsandbox/ssh/authorized_keys` when `MSB_HOME` is unset or empty. The file is created with private permissions.
+
+## msb ssh serve
+
+<Tooltip tip="Not available on microsandbox cloud; use msb ssh native sessions instead."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Serve a sandbox over SSH for external OpenSSH, SFTP, local TCP forwarding, dynamic TCP forwarding, or `ProxyCommand` clients.
+
+```bash
+msb ssh serve devbox
+msb ssh serve devbox --host 127.0.0.1 --port 2222
+msb ssh serve devbox --stdio
+```
+
+| Flag | Description |
+|------|-------------|
+| `--host HOST` | Listener host. Defaults to `127.0.0.1` |
+| `-p`, `--port PORT` | Listener port. Defaults to `2222` |
+| `--stdio` | Serve one SSH transport over stdin/stdout for OpenSSH `ProxyCommand` |
+| `--inactivity-timeout DURATION` | Disconnect each connection after this much SSH inactivity. Use `0` to disable |
+| `--no-inactivity-timeout` | Disable the SSH inactivity timeout |
+
+Listener mode accepts ordinary OpenSSH clients:
+
+```bash
+ssh -p 2222 root@127.0.0.1
+sftp -P 2222 root@127.0.0.1
+ssh -p 2222 -L 8080:127.0.0.1:80 root@127.0.0.1
+ssh -p 2222 -D 1080 root@127.0.0.1
+```
+
+Forwarded TCP connections originate inside the guest through microsandbox's agent. Sandbox network policy still applies, and guest loopback addresses refer to the sandbox, not the host. Reverse forwarding (`-R`) and stream-local forwarding are not supported.
+
+`--stdio` is for clients that spawn `msb` as a transport bridge:
+
+```sshconfig
+Host devbox.msb
+  User root
+  ProxyCommand msb ssh serve devbox --stdio
+```
+
+## msb ssh connect
+
+Explicit form of [`msb ssh`](#msb-ssh), with the same arguments and options.
+
+```bash
+msb ssh connect devbox
+```
+
+All SSH commands inherit `ssh.inactivity_timeout_secs` from user configuration when neither timeout flag is present. The built-in default is 10 minutes. A [managed timeout](/configuration#ssh) takes precedence over both flags, including `--no-inactivity-timeout`, for local and cloud sessions.
+
+## SSH state
+
+| Path | Purpose |
+|------|---------|
+| `<sandbox-dir>/ssh/host_ed25519` | Per-sandbox SSH host private key, created on first serve |
+| `<MSB_HOME>/ssh/authorized_keys` | Public keys allowed to connect |
+
+When `MSB_HOME` is unset or empty, `<MSB_HOME>` is `~/.microsandbox`.

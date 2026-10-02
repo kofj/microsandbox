@@ -1,11 +1,19 @@
 # Folders to ignore
 build/
 ignore/
+vendor/
 .git/
 .github/
 .menv/
 .vscode/
+.claude/
 assets/
+examples/**/rootfs-alpine/
+examples/**/qcow2-alpine/
+examples/**/sample-images/
+sdk/**/node_modules/
+sdk/python/.venv/
+sdk/**/dist/
 
 # Temporary and cache files
 **/*.o
@@ -19,6 +27,7 @@ assets/
 **/*.swp
 **/*.swo
 target/
+**/target/
 
 # Specific files that aren't needed
 **/*.log
@@ -30,14 +39,3 @@ target/
 **/*.env
 **/*.example
 **/*.test
-
-# Keep necessary files for cargo build
-!Cargo.toml
-!Cargo.lock
-!microsandbox-portal/
-!microsandbox-utils/
-!microsandbox-cli/
-!microsandbox-core/
-!microsandbox-server/
-!rust-toolchain.toml
-!deny.toml

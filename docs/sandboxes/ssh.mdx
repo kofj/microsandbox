@@ -1,0 +1,297 @@
+---
+title: SSH
+description: Connect to sandboxes through SSH protocol sessions
+keywords: ["sandbox SSH", "SSH connection", "remote shell", "SFTP"]
+icon: "computer"
+---
+
+SSH gives a sandbox a familiar interface without putting an SSH daemon inside the guest. microsandbox speaks SSH on the host side, then forwards shells, remote commands, SFTP file operations, and local TCP forwarding into the sandbox.
+
+Use it when you want existing SSH tools to work with a sandbox, or when you want SDK code to use SSH semantics while still going through microsandbox.
+
+There are two ways to connect:
+
+- **Native sessions** use the built-in microsandbox SSH client. No host `ssh` binary, TCP listener, or authorized key is required, which makes it the quickest path for a shell from `msb` or SSH semantics from the SDK.
+- **External clients** serve the sandbox as an SSH server so standard tools such as `ssh`, `sftp`, and `ProxyCommand` can connect.
+
+SSH sessions disconnect after 10 minutes without traffic by default. [Change or disable the inactivity timeout](#inactivity-timeout).
+
+## Native sessions
+
+Native sessions keep the SSH protocol boundary but do not expose a listener.
+
+### CLI
+
+```bash
+msb ssh devbox
+msb ssh connect devbox
+```
+
+With no remote command, the CLI opens an interactive shell. With `--`, the remaining tokens become the SSH command string and run through the sandbox shell.
+
+```bash
+msb ssh devbox -- uname -a
+msb ssh devbox -- sh -lc "cd /app && npm test"
+```
+
+If a sandbox name collides with an SSH subcommand such as `serve` or `authorize`, use `--name`:
+
+```bash
+msb ssh --name serve
+msb ssh --name authorize -- uptime
+```
+
+### SDK
+
+<CodeGroup>
+```typescript TypeScript
+const sb = await Sandbox.start("devbox");
+const ssh = await sb.ssh().open_client();
+
+const output = await ssh.exec("uname -a");
+console.log(output.stdout.toString());
+
+await ssh.close();
+```
+
+```rust Rust
+let sb = Sandbox::start("devbox").await?;
+let ssh = sb.ssh().open_client().await?;
+
+let output = ssh.exec("uname -a").await?;
+println!("{}", String::from_utf8_lossy(&output.stdout));
+
+ssh.close().await?;
+```
+
+```python Python
+sb = await Sandbox.start("devbox")
+ssh = await sb.ssh().open_client()
+
+output = await ssh.exec("uname -a")
+print(output.stdout_text)
+
+await ssh.close()
+```
+
+```go Go
+sb, err := m.StartSandbox(ctx, "devbox")
+if err != nil {
+    return err
+}
+defer sb.Close()
+
+ssh, err := sb.SSH().OpenClient(ctx)
+if err != nil {
+    return err
+}
+defer ssh.Close(ctx)
+
+output, err := ssh.Exec(ctx, "uname -a")
+if err != nil {
+    return err
+}
+fmt.Print(string(output.Stdout))
+```
+</CodeGroup>
+
+### Interactive attach
+
+SDK clients can attach the local terminal to an SSH shell. This requires a real terminal.
+
+<CodeGroup>
+```typescript TypeScript
+const ssh = await sb.ssh().open_client({ term: "xterm-256color" });
+const code = await ssh.attach({ detachKeys: "ctrl-]" });
+```
+
+```rust Rust
+let code = sb
+    .ssh()
+    .connect_with(|ssh| ssh.term("xterm-256color"))
+    .await?
+    .attach()
+    .await?;
+```
+
+```python Python
+ssh = await sb.ssh().open_client(term="xterm-256color")
+code = await ssh.attach(detach_keys="ctrl-]")
+```
+
+```go Go
+ssh, err := sb.SSH().OpenClient(ctx, m.WithSSHTerm("xterm-256color"))
+if err != nil {
+    return err
+}
+code, err := ssh.Attach(ctx, m.WithSSHDetachKeys("ctrl-]"))
+```
+</CodeGroup>
+
+### SFTP
+
+The native SSH client can open SFTP over the same SSH connection.
+
+<CodeGroup>
+```typescript TypeScript
+const sftp = await ssh.sftp();
+await sftp.write("/tmp/hello.txt", Buffer.from("hello"));
+const data = await sftp.read("/tmp/hello.txt");
+await sftp.close();
+```
+
+```rust Rust
+let sftp = ssh.sftp().await?;
+sftp.write("/tmp/hello.txt", b"hello").await?;
+let data = sftp.read("/tmp/hello.txt").await?;
+sftp.close().await?;
+```
+
+```python Python
+sftp = await ssh.sftp()
+await sftp.write("/tmp/hello.txt", b"hello")
+data = await sftp.read("/tmp/hello.txt")
+await sftp.close()
+```
+
+```go Go
+sftp, err := ssh.SFTP(ctx)
+if err != nil {
+    return err
+}
+defer sftp.Close(ctx)
+
+if err := sftp.Write(ctx, "/tmp/hello.txt", []byte("hello")); err != nil {
+    return err
+}
+data, err := sftp.Read(ctx, "/tmp/hello.txt")
+```
+</CodeGroup>
+
+## External clients
+
+<Tooltip tip="msb ssh serve is not available on microsandbox cloud. The SDK reusable server works when you supply explicit host-key and authorized-key material; native sessions work unchanged."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+External client mode exposes a sandbox as an SSH server for tools that already speak SSH. This is the closest match for normal SSH usage: authorize a public key, serve the sandbox, then connect with `ssh` or `sftp`.
+
+### Authorize a key
+
+```bash
+msb ssh authorize --file ~/.ssh/id_ed25519.pub
+msb ssh authorize --key "ssh-ed25519 AAAA... user@host"
+cat ~/.ssh/id_ed25519.pub | msb ssh authorize --stdin
+```
+
+microsandbox appends keys to `<MSB_HOME>/ssh/authorized_keys`.
+
+### TCP listener
+
+```bash
+msb ssh serve devbox
+```
+
+The default listener is `127.0.0.1:2222`.
+
+```bash
+ssh -p 2222 root@127.0.0.1
+sftp -P 2222 root@127.0.0.1
+```
+
+Choose a different bind address or port when needed:
+
+```bash
+msb ssh serve devbox --host 127.0.0.1 --port 2223
+```
+
+<Note>
+  Binding to `0.0.0.0` exposes the SSH listener beyond the local machine. Keep the default loopback bind unless you intentionally want remote clients to connect.
+</Note>
+
+### Port forwarding
+
+OpenSSH local (`-L`) and dynamic (`-D`) forwarding work through the listener:
+
+```bash
+ssh -p 2222 -L 8080:127.0.0.1:80 root@127.0.0.1
+ssh -p 2222 -D 1080 root@127.0.0.1
+```
+
+microsandbox opens forwarded TCP connections from inside the sandbox, so destination reachability follows the sandbox's network policy. `127.0.0.1` refers to the sandbox's loopback interface rather than the host's. microsandbox does not support reverse forwarding (`-R`) or stream-local forwarding.
+
+### ProxyCommand
+
+`msb ssh serve --stdio` carries a single SSH connection over stdin/stdout instead of a TCP listener. Point OpenSSH at it with `ProxyCommand` so standard SSH tools can reach the sandbox by host alias.
+
+Add an entry to your `~/.ssh/config`:
+
+```sshconfig ~/.ssh/config
+Host devbox.msb
+  User root
+  ProxyCommand msb ssh serve devbox --stdio
+```
+
+The `Host` value is the alias you connect to, and `devbox` is the sandbox name passed to `msb ssh serve`.
+
+Once it is in place, the alias works with any OpenSSH-based tool:
+
+```bash
+ssh devbox.msb
+sftp devbox.msb
+scp ./build.tar devbox.msb:/tmp/
+rsync -av ./src/ devbox.msb:/app/
+```
+
+Editors that build on OpenSSH, such as VS Code Remote-SSH, connect to the `devbox.msb` host the same way.
+
+For a walkthrough using a TCP listener, see [Using with VS Code](/examples/development/vscode), including key authorization and troubleshooting.
+
+## Inactivity timeout
+
+SSH sessions disconnect after 10 minutes without SSH traffic by default. Any SSH input or output resets the timer. This transport timeout is independent of the sandbox lifecycle idle timeout: an SSH disconnect does not stop the sandbox.
+
+Set a global default in `~/.microsandbox/config.json`. Use `0` to disable the timeout:
+
+```json
+{
+  "ssh": {
+    "inactivity_timeout_secs": 0
+  }
+}
+```
+
+Override the user-configured value for one CLI session with `--inactivity-timeout 30m`, or disable it with `--no-inactivity-timeout`. A [managed timeout](/configuration#ssh) takes precedence over these options for local and cloud sessions. Each backend retains its loaded settings; construct a new backend to pick up file changes. This does not configure the hosted cloud SSH gateway.
+
+The same per-session options are available when opening native clients or preparing server endpoints through an SDK:
+
+<CodeGroup>
+```typescript TypeScript
+const ssh = await sb.ssh().openClient({ inactivityTimeoutSecs: 1800 });
+const persistent = await sb.ssh().openClient({ inactivityTimeoutSecs: 0 });
+```
+
+```rust Rust
+use std::time::Duration;
+
+let ssh = sb.ssh()
+    .connect_with(|opts| opts.inactivity_timeout(Duration::from_secs(1800)))
+    .await?;
+
+let persistent = sb.ssh()
+    .connect_with(|opts| opts.disable_inactivity_timeout())
+    .await?;
+```
+
+```python Python
+ssh = await sb.ssh().open_client(inactivity_timeout=1800)
+persistent = await sb.ssh().open_client(inactivity_timeout=0)
+```
+
+```go Go
+ssh, err := sb.SSH().OpenClient(ctx, m.WithSSHClientInactivityTimeout(30*time.Minute))
+persistent, err := sb.SSH().OpenClient(ctx, m.WithSSHClientInactivityTimeout(0))
+```
+</CodeGroup>
+
+## Reference
+
+For exact SSH APIs, see [TypeScript](/sdk/typescript/ssh), [Rust](/sdk/rust/ssh), [Python](/sdk/python/ssh), or [Go](/sdk/go/ssh). For terminal workflows and serving SSH connections, see [SSH commands](/cli/ssh-commands).

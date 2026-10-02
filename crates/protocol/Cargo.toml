@@ -1,0 +1,27 @@
+[package]
+name = "microsandbox-protocol"
+description = "Wire protocol types and serialization for the microsandbox project."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+bytes.workspace = true
+chrono.workspace = true
+ciborium.workspace = true
+microsandbox-types.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+strum.workspace = true
+thiserror.workspace = true
+zeroize = { workspace = true, features = ["derive"] }
+tokio = { version = "1.52", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full"] }
+serde_json.workspace = true

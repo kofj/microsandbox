@@ -1,255 +1,444 @@
-# Microsandbox Go SDK
+# microsandbox
 
-A Go SDK for interacting with Microsandbox environments.
-This SDK provides thread-safe access to running microsandbox environments for code execution, command running, and resource monitoring, without imposing any particular concurrency paradigm.
+Lightweight VM sandboxes for Go applications that need hardware-level isolation for AI agents, tools, tests, and untrusted code.
+
+The `github.com/superradcompany/microsandbox/sdk/go` module provides Go bindings to the [microsandbox](https://github.com/superradcompany/microsandbox) runtime. It creates microVM-backed sandboxes from OCI images or other rootfs sources, then exposes command execution, guest filesystem access, networking, secrets, volumes, metrics, logs, snapshots, and SSH/SFTP through an idiomatic Go API.
+
+For the full API reference and longer guides, use Go docs and the microsandbox docs site:
+
+- [pkg.go.dev](https://pkg.go.dev/github.com/superradcompany/microsandbox/sdk/go)
+- [Go SDK guide](https://docs.microsandbox.dev/sdk/go/sandbox)
+- [SDK overview](https://docs.microsandbox.dev/sdk/overview)
+- [Repository examples](./examples)
+
+`EnsureRuntime` reuses any complete `msb` and `libkrunfw` pair in `MSB_HOME` (or `~/.microsandbox` by default), without executing the binary or requiring its version to equal the SDK version. It refuses partial installations. The SDK version selects newly downloaded artifacts; it does not trigger replacement of an existing pair.
+
+## Features
+
+- Hardware VM isolation with a guest Linux kernel
+- Go API over an embedded CGO FFI library
+- Collected and streaming command execution
+- Guest filesystem read, write, list, copy, stat, and stream operations
+- Named volumes, bind mounts, tmpfs mounts, and disk-image mounts
+- Network policies, DNS filtering, TLS interception, secrets, and port publishing
+- Rootfs patches before boot
+- Detached sandboxes that can outlive the Go process
+- Metrics, logs, snapshots, SSH/SFTP, image cache, and local/cloud backend helpers
+
+## Requirements
+
+- Go 1.22+
+- CGO enabled and a C compiler/toolchain available
+- Linux with KVM, macOS with Apple Silicon, or Windows 11 with WHP enabled
+
+## Supported Platforms
+
+| Platform | Architecture | Notes |
+| --- | --- | --- |
+| macOS | ARM64 / Apple Silicon | Embedded FFI library |
+| Linux | x86_64 | Embedded FFI library |
+| Linux | ARM64 | Embedded FFI library |
+| Windows | x86_64, ARM64 | Embedded FFI library; runtime support is in preview |
+
+The Go binary embeds the SDK FFI library and extracts it on first use. The `msb` runtime and `libkrunfw` are installed separately into `MSB_HOME` (default `~/.microsandbox/`) by `EnsureRuntime` (`%USERPROFILE%\.microsandbox` on Windows).
 
 ## Installation
 
 ```bash
-go get github.com/microsandbox/microsandbox/sdk/go
+go get github.com/superradcompany/microsandbox/sdk/go
 ```
 
-## Quick Start
+Call `EnsureRuntime` at process startup when your program will create local sandboxes. It is idempotent and surfaces runtime download/setup failures before the first sandbox operation.
 
-### Basic Code Execution
+```go
+if _, err := microsandbox.EnsureRuntime(ctx, microsandbox.RuntimeConfig{}, microsandbox.InstallOptions{}); err != nil {
+    log.Fatalf("microsandbox setup: %v", err)
+}
+```
+
+Use `IsRuntimeInstalled(RuntimeConfig{})` for a boolean availability check or `ResolveRuntime(RuntimeConfig{})` to require an existing pair and obtain its paths without installing runtime binaries. `InstallRuntime` explicitly provisions the selected source. All setup calls use the shared Rust resolver and installer; the first call may also materialize the embedded SDK FFI library.
+
+## Quick Start
 
 ```go
 package main
 
 import (
+    "context"
     "fmt"
     "log"
+    "time"
 
-    "github.com/microsandbox/microsandbox/sdk/go"
+    microsandbox "github.com/superradcompany/microsandbox/sdk/go"
 )
 
 func main() {
-    // Create a Python sandbox
-    sandbox := msb.NewPythonSandbox(
-        msb.WithName("my-sandbox"),
-        msb.WithReqIdProducer(
-            func() string {
-                return "Optionally, import UUID package here if desired."
-            }),
+    ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+    defer cancel()
+
+    if _, err := microsandbox.EnsureRuntime(ctx, microsandbox.RuntimeConfig{}, microsandbox.InstallOptions{}); err != nil {
+        log.Fatal(err)
+    }
+
+    name := "go-readme"
+    sb, err := microsandbox.CreateSandbox(ctx, name,
+        microsandbox.WithImage("alpine:3.19"),
+        microsandbox.WithMemory(512),
+        microsandbox.WithCPUs(1),
+        microsandbox.WithReplace(),
     )
-
-    // Start the sandbox
-    if err := sandbox.Start("", 512, 1); err != nil {
-        log.Fatal(err)
-    }
-    defer sandbox.Stop()
-
-    // Execute code
-    execution, err := sandbox.Code().Run("print('Hello from Go SDK!')")
     if err != nil {
         log.Fatal(err)
     }
+    defer func() {
+        stopCtx, stopCancel := context.WithTimeout(context.Background(), 30*time.Second)
+        defer stopCancel()
+        _ = sb.Stop(stopCtx)
+        _ = sb.Close()
+        _ = microsandbox.RemoveSandbox(context.Background(), name)
+    }()
 
-    // Get the output using rich parsing
-    output, err := execution.GetOutput()
+    out, err := sb.Shell(ctx, "echo 'Hello from microsandbox!'")
     if err != nil {
         log.Fatal(err)
     }
-
-    fmt.Println(output) // prints: Hello from Go SDK!
+    fmt.Println(out.Stdout())
 }
 ```
+
+### Reusable Lifecycle Convergence
+
+Use `ConnectOrCreateSandbox` when a stable name should converge on one persisted sandbox. Existing configuration wins; options are used only if creation is necessary. Handles retain a stable `ID`, so lifecycle calls on stale receivers refuse to act on a replacement that reused the name.
+
+```go
+sb, err := microsandbox.ConnectOrCreateSandbox(ctx, "worker",
+    microsandbox.WithImage("python"),
+    microsandbox.WithMemory(1024),
+)
+
+fmt.Printf("%s: %s\n", sb.Name(), sb.ID())
+handle, err := microsandbox.GetSandbox(ctx, "worker")
+running, err := handle.ConnectOrStart(ctx)
+err = running.RequestStop(ctx)
+stopped, err := running.WaitForStatus(ctx, microsandbox.SandboxStatusStopped)
+restarted, err := stopped.Restart(ctx)
+err = restarted.Destroy(ctx)
+```
+
+## Common Examples
+
+These snippets assume you already have a live `sb *microsandbox.Sandbox` and `ctx context.Context`. See [sdk/go/examples](./examples) for complete runnable programs.
+
+### Fork a Live Sandbox
+
+Forking copies a running or paused local sandbox's disk and execution state into an independent child. Memory uses copy-on-write automatically. The source keeps its previous running or paused state. Host resources require explicit bindings; see [forking and resource bindings](https://docs.microsandbox.dev/sandboxes/snapshots#forking).
+
+```go
+child, err := sb.Fork(ctx, "experiment")
+if err != nil { return err }
+defer child.Close()
+if err := child.Stop(ctx); err != nil { return err }
+```
+
+Use `ForkMany(ctx, []string{"alice", "bob"})` to capture once for several children. Inspect every returned outcome: one child's startup failure does not remove successful siblings. See the [fork API reference](https://docs.microsandbox.dev/sdk/go/sandbox#forking).
+
+Restoring starts from a saved snapshot instead. Use `WithCowMemory()` to request copy-on-write memory for a full-snapshot restore. A generation describes snapshot-history progression; a branch describes a distinct path through that history. The former live branch APIs and old CoW restore names remain deprecated aliases. See [restore migration notes](https://docs.microsandbox.dev/sandboxes/snapshots#migrating-restore-options) for the old-to-new names and language-specific deprecation notices.
 
 ### Command Execution
 
 ```go
-// Execute shell commands
-cmdExecution, err := sandbox.Command().Run("ls", []string{"-la", "/"})
+out, err := sb.Exec(ctx, "python3", []string{"-c", "print(1 + 1)"})
 if err != nil {
     log.Fatal(err)
 }
+fmt.Println(out.Stdout())
+fmt.Println(out.ExitCode())
 
-// Check command success and get output
-if cmdExecution.IsSuccess() {
-    output, _ := cmdExecution.GetOutput()
-    fmt.Println("Directory listing:", output)
-} else {
-    errorOutput, _ := cmdExecution.GetError()
-    fmt.Printf("Command failed with exit code %d: %s\n",
-        cmdExecution.GetExitCode(), errorOutput)
-}
+out, err = sb.Shell(ctx, "echo hello && pwd")
+
+out, err = sb.Exec(ctx, "make", []string{"build"},
+    microsandbox.WithExecCwd("/app"),
+    microsandbox.WithExecTimeout(30*time.Second),
+)
 ```
 
-### Resource Metrics
+Non-zero process exits are represented on `ExecOutput`; they are not Go errors by themselves.
+
+### Streaming Execution
 
 ```go
-// Get comprehensive metrics
-metrics, err := sandbox.Metrics().All()
+handle, err := sb.ShellStream(ctx, "tail -f /var/log/app.log")
 if err != nil {
     log.Fatal(err)
 }
+defer handle.Close()
 
-fmt.Printf("CPU: %.2f%%, Memory: %d MiB, Disk: %d bytes\n",
-    metrics.CPU, metrics.MemoryMiB, metrics.DiskBytes)
-
-// Or get individual metrics
-cpu, err := sandbox.Metrics().CPU()
-memory, err := sandbox.Metrics().MemoryMiB()
-```
-
-## Advanced Usage
-
-### Concurrent Execution
-
-The SDK is thread-safe and designed for easy integration with a variety of concurrency models:
-
-```go
-// Concurrent execution with goroutines
-var wg sync.WaitGroup
-results := make(chan string, 3)
-
-for i := 0; i < 3; i++ {
-    wg.Add(1)
-    go func(taskID int) {
-        defer wg.Done()
-
-        code := fmt.Sprintf("print('Task %d completed')", taskID)
-        execution, err := sandbox.Code().Run(code)
-        if err != nil {
-            results <- fmt.Sprintf("Task %d failed: %v", taskID, err)
-            return
-        }
-
-        output, _ := execution.GetOutput()
-        results <- fmt.Sprintf("Task %d: %s", taskID, output)
-    }(i)
-}
-
-go func() {
-    wg.Wait()
-    close(results)
-}()
-
-for result := range results {
-    fmt.Println(result)
+for {
+    event, err := handle.Recv(ctx)
+    if err != nil {
+        break
+    }
+    switch event.Kind {
+    case microsandbox.ExecEventStdout:
+        _, _ = os.Stdout.Write(event.Data)
+    case microsandbox.ExecEventStderr:
+        _, _ = os.Stderr.Write(event.Data)
+    case microsandbox.ExecEventExited, microsandbox.ExecEventDone:
+        return
+    }
 }
 ```
 
-### Worker Pool Pattern
+### Filesystem Operations
 
 ```go
-// Create a worker pool
-tasks := make(chan string, 10)
-results := make(chan string, 10)
+fs := sb.FS()
 
-// Start workers
-for i := 0; i < 3; i++ {
-    go func(workerID int) {
-        for code := range tasks {
-            execution, err := sandbox.Code().Run(code)
-            if err != nil {
-                results <- fmt.Sprintf("Worker %d error: %v", workerID, err)
-                continue
-            }
-
-            output, _ := execution.GetOutput()
-            results <- fmt.Sprintf("Worker %d: %s", workerID, output)
-        }
-    }(i)
+if err := fs.WriteString(ctx, "/tmp/config.json", `{"debug": true}`); err != nil {
+    log.Fatal(err)
 }
 
-// Send tasks
-for i := 0; i < 10; i++ {
-    tasks <- fmt.Sprintf("print('Processing item %d')", i)
+content, err := fs.ReadString(ctx, "/tmp/config.json")
+if err != nil {
+    log.Fatal(err)
 }
-close(tasks)
+fmt.Println(content)
+
+entries, err := fs.List(ctx, "/etc")
+if err != nil {
+    log.Fatal(err)
+}
+for _, entry := range entries {
+    fmt.Printf("%s (%s)\n", entry.Path, entry.Kind)
+}
 ```
 
-### Configuration Options
+### Named Volumes
 
 ```go
-// Comprehensive configuration
-sandbox := msb.NewNodeSandbox(
-    msb.WithName("advanced-sandbox"),
-    msb.WithServerUrl("http://localhost:5555"),
-    msb.WithNamespace("production"),
-    msb.WithApiKey("your-api-key"),
-    msb.WithLogger(msb.NewDefaultSlogAdapter()),
-    msb.WithHTTPClient(&http.Client{
-        Timeout: 30 * time.Second,
+volume, err := microsandbox.CreateVolume(ctx, "go-readme-data",
+    microsandbox.WithVolumeQuota(100),
+    microsandbox.WithVolumeLabels(map[string]string{"purpose": "readme"}),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer volume.Remove(ctx)
+
+writer, err := microsandbox.CreateSandbox(ctx, "go-readme-writer",
+    microsandbox.WithImage("alpine:3.19"),
+    microsandbox.WithMounts(map[string]microsandbox.MountConfig{
+        "/data": microsandbox.Mount.Named("go-readme-data", microsandbox.MountOptions{}),
     }),
+    microsandbox.WithReplace(),
 )
-```
-
-### Logging
-
-The SDK features a lightweight, pluggable logging adapter that allows users to freely configure any logger of their choice.
-By default, no logging is applied.
-
-```go
-// Enable structured logging
-logger := msb.NewDefaultSlogAdapter()
-sandbox := msb.NewPythonSandbox(
-    msb.WithLogger(logger),
-)
-
-// Or use a custom logger
-customLogger := msb.NewSlogAdapter(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
-```
-
-### Error Handling
-
-```go
-execution, err := sandbox.Code().Run("1/0")  // Will cause a Python error
 if err != nil {
-    log.Printf("Execution failed: %v", err)
-    return
+    log.Fatal(err)
 }
+defer writer.Close()
 
-// Check for execution errors
-if execution.HasError() {
-    errorOutput, _ := execution.GetError()
-    fmt.Printf("Code execution error: %s\n", errorOutput)
-    fmt.Printf("Status: %s\n", execution.GetStatus())
-}
+_, err = writer.Shell(ctx, "echo 'hello' > /data/message.txt")
 ```
 
-## Configuration
-
-### Environment Variables
-
-- `MSB_API_KEY`: API key for Microsandbox server authentication
-- `MSB_SERVER_URL`: Microsandbox server URL (default: `http://127.0.0.1:5555`)
-
-### Start Parameters
+### Network, DNS, and Ports
 
 ```go
-// Start with custom resources
-err := sandbox.Start(
-    "custom-image:latest", // Docker image (empty = language default)
-    1024,                  // Memory in MB (0 = default 512MB)
-    2,                     // CPU cores (0 = default 1)
+isolated, err := microsandbox.CreateSandbox(ctx, "go-readme-isolated",
+    microsandbox.WithImage("alpine:3.19"),
+    microsandbox.WithNetwork(microsandbox.NetworkPolicy.None()),
+    microsandbox.WithReplace(),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer isolated.Close()
+
+filtered, err := microsandbox.CreateSandbox(ctx, "go-readme-filtered",
+    microsandbox.WithImage("alpine:3.19"),
+    microsandbox.WithNetwork(&microsandbox.NetworkConfig{
+        DenyDomains:        []string{"blocked.example.com"},
+        DenyDomainSuffixes: []string{".evil.com"},
+        DNS: &microsandbox.DNSConfig{
+            Nameservers: []string{"1.1.1.1:53"},
+        },
+    }),
+    microsandbox.WithReplace(),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer filtered.Close()
+
+web, err := microsandbox.CreateSandbox(ctx, "go-readme-web",
+    microsandbox.WithImage("python:3.12"),
+    microsandbox.WithPorts(map[uint16]uint16{8080: 80}),
+    microsandbox.WithReplace(),
 )
 ```
 
-## Examples
+### Secrets
 
-See the [examples directory](./cmd/) for comprehensive examples:
+Secrets use placeholder substitution. The real value stays on the host and is substituted only for allowed network destinations.
 
-- **[command-example.go](./cmd/command-example.go)**: Shell command execution patterns
-- **[metrics-example.go](./cmd/metrics-example.go)**: Resource monitoring and load testing
-- **[node-example.go](./cmd/node-example.go)**: Node.js code execution and module usage
-- **[repl-example.go](./cmd/repl-example.go)**: Python REPL patterns and data processing
-- **[concurrent-example.go](./cmd/concurrent-example.go)**: Go-specific concurrency patterns
+```go
+sb, err := microsandbox.CreateSandbox(ctx, "go-readme-agent",
+    microsandbox.WithImage("python:3.12"),
+    microsandbox.WithSecrets(microsandbox.Secret.Env(
+        "OPENAI_API_KEY",
+        os.Getenv("OPENAI_API_KEY"),
+        microsandbox.SecretEnvOptions{Allow: []string{"api.openai.com"}},
+    )),
+    microsandbox.WithReplace(),
+)
+```
 
-## Requirements
+### Rootfs Patches
 
-- Go 1.24
-- Running Microsandbox server (default: http://127.0.0.1:5555)
-- API key (if authentication is enabled on the server)
+```go
+sb, err := microsandbox.CreateSandbox(ctx, "go-readme-patched",
+    microsandbox.WithImage("alpine:3.19"),
+    microsandbox.WithPatches(
+        microsandbox.Patch.Text("/etc/greeting.txt", "Hello!\n", microsandbox.PatchOptions{}),
+        microsandbox.Patch.Mkdir("/app", microsandbox.PatchOptions{}),
+        microsandbox.Patch.Text("/app/config.json", `{"debug": true}`, microsandbox.PatchOptions{}),
+        microsandbox.Patch.Append("/etc/hosts", "127.0.0.1 myapp.local\n"),
+    ),
+    microsandbox.WithReplace(),
+)
+```
 
-## Performance
+### Detached Mode
 
-- **Connection Pooling**: Reuses HTTP connections for efficiency
-- **Memory Efficient**: Value types avoid unnecessary heap allocations
-- **Structured Parsing**: Parse execution results once, access multiple times
-- **Zero Dependencies**: Only uses Go standard library
+```go
+sb, err := microsandbox.CreateSandbox(ctx, "go-readme-background",
+    microsandbox.WithImage("python:3.12"),
+    microsandbox.WithDetached(),
+    microsandbox.WithReplace(),
+)
+if err != nil {
+    log.Fatal(err)
+}
+_ = sb.Detach(ctx)
+
+handle, err := microsandbox.GetSandbox(ctx, "go-readme-background")
+if err != nil {
+    log.Fatal(err)
+}
+reconnected, err := handle.Connect(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+out, err := reconnected.Shell(ctx, "echo reconnected")
+```
+
+### Metrics
+
+```go
+metrics, err := sb.Metrics(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("CPU: %.1f%%\n", metrics.CPUPercent)
+fmt.Printf("Memory: %.1f MiB\n", float64(metrics.MemoryBytes)/1024/1024)
+
+stream, err := sb.MetricsStream(ctx, 500*time.Millisecond)
+if err != nil {
+    log.Fatal(err)
+}
+defer stream.Close()
+
+sample, err := stream.Recv(ctx)
+if err == nil && sample != nil {
+    fmt.Printf("CPU: %.1f%%\n", sample.CPUPercent)
+}
+```
+
+### Typed Errors
+
+Go SDK errors can be checked with `IsKind` and unwrapped with `errors.As`.
+
+```go
+_, err := microsandbox.GetSandbox(ctx, "missing")
+if microsandbox.IsKind(err, microsandbox.ErrSandboxNotFound) {
+    fmt.Println("sandbox does not exist")
+}
+
+var msbErr *microsandbox.Error
+if errors.As(err, &msbErr) {
+    fmt.Printf("microsandbox error kind: %s\n", msbErr.Kind)
+}
+```
+
+## Runnable Examples
+
+Each example is a self-contained `main.go` under [sdk/go/examples](./examples). Run them from `sdk/go`:
+
+```bash
+go run ./examples/basic
+go run ./examples/network
+go run ./examples/snapshot-fork
+```
+
+| Example | Covers |
+| --- | --- |
+| `basic` | Create, exec, filesystem, metrics, stop, close, remove |
+| `cloud-backend` | Cloud backend lifecycle and live logs |
+| `detached` | Detached lifecycle, reattach, stop, and remove |
+| `disk` | Build and mount a raw ext4 disk image |
+| `errors` | Error categories with `IsKind` and `errors.As` |
+| `filesystem` | Guest filesystem operations and streaming |
+| `image-cache` | Cached OCI image list, inspect, remove, and prune |
+| `metrics` | Point-in-time and streaming metrics |
+| `network` | Presets, DNS, TLS, and custom network settings |
+| `patches` | Pre-boot rootfs patches |
+| `ports` | Guest TCP port publishing |
+| `secrets` | Secret placeholder injection |
+| `snapshot-fork` | Snapshot a stopped sandbox and restore a fresh sandbox |
+| `streaming` | Streaming exec, signals, and cancellation |
+| `tls` | TLS interception configuration |
+| `volumes` | Named volume lifecycle |
+
+The `snapshot-fork` example keeps its historical directory name; it demonstrates restoring a saved disk snapshot. Live forking uses the `Fork` API.
+
+## More Documentation
+
+- [Sandbox lifecycle](https://docs.microsandbox.dev/sdk/go/sandbox)
+- [Execution](https://docs.microsandbox.dev/sdk/go/execution)
+- [Filesystem](https://docs.microsandbox.dev/sdk/go/filesystem)
+- [Networking](https://docs.microsandbox.dev/sdk/go/networking)
+- [Secrets](https://docs.microsandbox.dev/sdk/go/secrets)
+- [Volumes](https://docs.microsandbox.dev/sdk/go/volumes)
+- [Snapshots](https://docs.microsandbox.dev/sdk/go/snapshots)
+- [Images](https://docs.microsandbox.dev/sdk/go/images)
+- [SSH](https://docs.microsandbox.dev/sdk/go/ssh)
+- [Agent client](https://docs.microsandbox.dev/sdk/go/agent-client)
+
+## Development
+
+The SDK embeds the FFI library at build time, so normal unit tests do not require a Rust toolchain:
+
+```bash
+cd sdk/go
+go test -count=1 ./...
+```
+
+To iterate on the FFI shim itself, build the native library from the repository root, then run Go commands from `sdk/go` with `MICROSANDBOX_FFI_PATH` and the `microsandbox_ffi_path` build tag:
+
+```bash
+cargo build -p microsandbox-go
+
+cd sdk/go
+export MICROSANDBOX_FFI_PATH=../../target/debug/libmicrosandbox_go_ffi.dylib
+go run -tags microsandbox_ffi_path ./examples/basic
+```
+
+Use `libmicrosandbox_go_ffi.so` for Linux. Full integration tests require local virtualization support and runtime artifacts:
+
+```bash
+go test -tags "smoke microsandbox_ffi_path" -count=1 .
+go test -tags "integration microsandbox_ffi_path" -v -count=1 ./integration/...
+```
 
 ## License
 
-[Apache 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+Apache-2.0

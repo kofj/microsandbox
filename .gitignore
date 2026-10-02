@@ -23,3 +23,36 @@ libkrunfw.*
 libkrun.*
 .menv/
 Sandboxfile*
+
+# Retype
+.retype/
+.claude
+
+# Node
+node_modules/
+dist/
+
+# Platform-package payloads — populated by sdk/node-ts/scripts/prepare-platform-package.mjs.
+# The committed package.json stays; binaries are produced per-target in CI.
+sdk/node-ts/npm/*/bin/
+sdk/node-ts/npm/*/lib/
+sdk/node-ts/npm/*/*.node
+
+# Ruby SDK platform-gem build outputs — staged per-ABI binaries, packaged gems,
+# and the CI-only cargo patch config written by `rake cargo:patch_workspace`.
+sdk/ruby/pkg/
+sdk/ruby/tmp/
+sdk/ruby/.cargo/
+sdk/ruby/ext/microsandbox/Cargo.lock.orig
+sdk/ruby/lib/microsandbox/*.so
+sdk/ruby/lib/microsandbox/*.bundle
+sdk/ruby/lib/microsandbox/[0-9].[0-9]/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+.venv/

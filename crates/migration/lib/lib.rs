@@ -1,0 +1,92 @@
+//! Database migrations for microsandbox.
+
+mod m20260305_000001_create_image_tables;
+mod m20260305_000002_create_sandbox_tables;
+mod m20260305_000003_create_storage_tables;
+mod m20260305_000004_create_sandbox_images_table;
+mod m20260410_000001_erofs_image_schema;
+mod m20260501_000001_create_snapshot_index;
+mod m20260517_000001_drop_sandbox_metric;
+mod m20260527_000001_migrate_oci_rootfs_source;
+mod m20260531_000001_create_sandbox_labels;
+mod m20260531_000002_index_sandbox_labels_key_value;
+mod m20260606_000001_named_volume_kinds;
+mod m20260621_000001_add_sandbox_ephemeral;
+mod m20260621_000002_create_maintenance_lease;
+mod m20260703_000001_add_sandbox_active_config;
+mod m20260708_000001_migrate_bind_rootfs_source;
+mod m20260710_000001_migrate_root_disk;
+mod m20260714_000001_add_snapshot_scope;
+mod m20260719_000001_create_cpu_allocations;
+mod m20260723_000001_snapshot_artifact_transition;
+mod m20260803_000001_create_writeback_allocations;
+mod m20260808_000001_create_memory_allocation_nodes;
+mod m20260810_000001_rebuild_sandbox_labels;
+mod m20260813_000001_share_cpu_allocations;
+mod m20260818_000001_sandbox_network_slot;
+mod m20260824_000001_mount_owner_config;
+mod m20260829_000001_split_snapshot_identity;
+mod m20260910_000001_snapshot_groups;
+mod m20260922_000001_migrate_secret_config;
+mod m20261001_000001_guest_clock_config;
+pub mod schema_metadata;
+
+use sea_orm_migration::prelude::*;
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use sea_orm_migration::MigratorTrait;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// The migrator that runs all migrations in order.
+pub struct Migrator;
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl MigratorTrait for Migrator {
+    fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+        vec![
+            Box::new(m20260305_000001_create_image_tables::Migration),
+            Box::new(m20260305_000002_create_sandbox_tables::Migration),
+            Box::new(m20260305_000003_create_storage_tables::Migration),
+            Box::new(m20260305_000004_create_sandbox_images_table::Migration),
+            Box::new(m20260410_000001_erofs_image_schema::Migration),
+            Box::new(m20260501_000001_create_snapshot_index::Migration),
+            Box::new(m20260517_000001_drop_sandbox_metric::Migration),
+            Box::new(m20260527_000001_migrate_oci_rootfs_source::Migration),
+            Box::new(m20260531_000001_create_sandbox_labels::Migration),
+            Box::new(m20260531_000002_index_sandbox_labels_key_value::Migration),
+            Box::new(m20260606_000001_named_volume_kinds::Migration),
+            Box::new(m20260621_000001_add_sandbox_ephemeral::Migration),
+            Box::new(m20260621_000002_create_maintenance_lease::Migration),
+            Box::new(m20260703_000001_add_sandbox_active_config::Migration),
+            Box::new(m20260708_000001_migrate_bind_rootfs_source::Migration),
+            Box::new(m20260710_000001_migrate_root_disk::Migration),
+            Box::new(m20260714_000001_add_snapshot_scope::Migration),
+            Box::new(m20260723_000001_snapshot_artifact_transition::Migration),
+            Box::new(m20260719_000001_create_cpu_allocations::Migration),
+            Box::new(m20260803_000001_create_writeback_allocations::Migration),
+            Box::new(m20260808_000001_create_memory_allocation_nodes::Migration),
+            Box::new(m20260810_000001_rebuild_sandbox_labels::Migration),
+            Box::new(m20260813_000001_share_cpu_allocations::Migration),
+            Box::new(m20260824_000001_mount_owner_config::Migration),
+            // This backdated migration first shipped in v0.6.16, after the
+            // v0.6.15 mount-owner marker. Keep release order here even though
+            // the identifiers sort differently.
+            Box::new(m20260818_000001_sandbox_network_slot::Migration),
+            // Unreleased snapshot-stack migrations follow the complete released prefix.
+            Box::new(m20260829_000001_split_snapshot_identity::Migration),
+            Box::new(m20260910_000001_snapshot_groups::Migration),
+            Box::new(m20260922_000001_migrate_secret_config::Migration),
+            Box::new(m20261001_000001_guest_clock_config::Migration),
+        ]
+    }
+}

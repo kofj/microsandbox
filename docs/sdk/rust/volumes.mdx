@@ -1,0 +1,1797 @@
+---
+title: Volumes
+description: Rust SDK - Volume API reference
+keywords: ["Rust SDK", "Rust volumes", "microsandbox volumes"]
+---
+
+Create, manage, and mount named volumes. See [Volumes](/sandboxes/volumes) for usage examples.
+
+## Sandbox-owned mounts
+
+Local storage can belong directly to a sandbox, with no volume name or separate cleanup:
+
+```rust
+let sb = Sandbox::builder("worker").image("alpine")
+    .volume("/cache", |v| v.owned())
+    .volume("/data", |v| v.owned_with(|d| d.disk().size(1024_u32)))
+    .create().await?;
+```
+
+`.owned()` creates an empty directory. `.owned_with(...)` accepts `.directory().quota(...)` or `.disk().size(...)`; disks are raw ext4 and require a positive size. Common mount flags stay on `MountBuilder`. The backing survives stop/start, is captured by snapshots and forks, and is removed with the sandbox. Restore makes private copies automatically. Cloud rejects owned mounts.
+
+## Volume
+
+#### <span className="msb-recv">Volume::</span><span className="msb-hn">get_default()</span>
+
+<Tooltip tip="Available only on microsandbox cloud; the local backend has no default volume."><span className="msb-badge-cloud">Cloud-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn get_default() -> MicrosandboxResult<VolumeHandle>
+```
+
+Get the Cloud account's always-present default volume. It has no user-assigned name, cannot be removed, and supports direct filesystem operations through `.fs()`. The local backend returns a typed `Unsupported` error; it never substitutes a directory from the caller's machine.
+
+```rust
+let volume = Volume::get_default().await?;
+volume.fs().write("customers/acme.json", br#"{"active":true}"#).await?;
+println!("{}", volume.fs().read_to_string("customers/acme.json").await?);
+```
+
+#### <span className="msb-recv">Volume::</span><span className="msb-hn">builder()</span>
+
+```rust
+fn builder(name: impl Into<String>) -> VolumeBuilder
+```
+
+<Accordion title="Example">
+
+```rust
+let vol = Volume::builder("pip-cache").create().await?;
+```
+
+</Accordion>
+
+Create a builder for configuring a new named volume. Directory-backed volumes are the default; call [`.disk()`](#volume_builder-disk) then [`.size()`](#volume_builder-size) for a raw ext4 disk-image volume. Volume names must start with an alphanumeric character and contain only alphanumeric characters, dots, hyphens, and underscores. See [`VolumeBuilder`](#volumebuilder-2) for all options.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Volume name, e.g. <code>"pip-cache"</code>.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumebuilder-2">VolumeBuilder</a></div>
+    <div className="msb-param-desc">Builder for configuring the volume.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">Volume::</span><span className="msb-hn">create()</span>
+
+<Tooltip tip="Microsandbox cloud creates directory volumes only; capacity is unavailable and quota must be a nonzero whole number of GiB."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+async fn create(config: VolumeConfig) -> MicrosandboxResult<Volume>
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::volume::{VolumeConfig, VolumeKind};
+
+let vol = Volume::create(VolumeConfig {
+    name: "cache".into(),
+    kind: VolumeKind::Directory,
+    quota_mib: Some(1024),
+    capacity_mib: None,
+    labels: vec![("team".into(), "ml".into())],
+})
+.await?;
+```
+
+</Accordion>
+
+Provision a volume from a [`VolumeConfig`](#volumespec). Routes through the active backend. Locally this inserts a database record and creates the host directory (formatting a `disk.raw` for disk volumes). Fails with `VolumeAlreadyExists` if a volume of the same name already exists. Most callers use [`Volume::builder()`](#volumebuilder), which calls this internally.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>config</code><a className="msb-type" href="#volumespec">VolumeConfig</a></div>
+    <div className="msb-param-desc">Volume configuration. <code>VolumeConfig</code> is an alias for <a className="msb-type" href="#volumespec">VolumeSpec</a>.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volume">Volume</a></div>
+    <div className="msb-param-desc">The created volume.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">Volume::</span><span className="msb-hn">get()</span>
+
+```rust
+async fn get(name: &str) -> MicrosandboxResult<VolumeHandle>
+```
+
+<Accordion title="Example">
+
+```rust
+let h = Volume::get("pip-cache").await?;
+println!("{} - {} bytes used", h.name(), h.used_bytes());
+```
+
+</Accordion>
+
+Get a handle to an existing named volume. Use the handle to access the volume's filesystem from the host, read its metadata, or delete it. Fails with `VolumeNotFound` if no volume by that name exists.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumehandle">VolumeHandle</a></div>
+    <div className="msb-param-desc">Handle for host-side operations.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">Volume::</span><span className="msb-hn">list()</span>
+
+```rust
+async fn list() -> MicrosandboxResult<Vec<VolumeHandle>>
+```
+
+<Accordion title="Example">
+
+```rust
+for h in Volume::list().await? {
+    println!("{} - {:?}", h.name(), h.kind());
+}
+```
+
+</Accordion>
+
+List all named volumes, newest first.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumehandle">Vec&lt;VolumeHandle&gt;</a></div>
+    <div className="msb-param-desc">All volume handles.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">Volume::</span><span className="msb-hn">remove()</span>
+
+```rust
+async fn remove(name: &str) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+Volume::remove("pip-cache").await?;
+```
+
+</Accordion>
+
+Delete a named volume and its contents from disk. Locally the database record is deleted first, then the directory, so an orphaned directory is easier to detect than an orphaned record. Fails with `VolumeNotFound` if the volume does not exist.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+</div>
+
+<p className="msb-member-group">Instance methods</p>
+
+A live `Volume`, returned by [`Volume::create()`](#volumecreate) or [`VolumeBuilder::create()`](#vb-create). Carries the backend it was created on.
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">name()</span>
+
+```rust
+fn name(&self) -> &str
+```
+
+The unique name identifying this volume.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">kind()</span>
+
+```rust
+fn kind(&self) -> VolumeKind
+```
+
+The storage kind: [`Directory`](#volumekind) or [`Disk`](#volumekind).
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumekind">VolumeKind</a></div>
+    <div className="msb-param-desc">Storage kind.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">fs()</span>
+
+```rust
+fn fs(&self) -> VolumeFs<'_>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().write("/seed.txt", "hello").await?;
+```
+
+</Accordion>
+
+Get a filesystem handle for reading and writing the volume's files directly, without a running sandbox. Local volumes route to `tokio::fs`; Cloud volumes route through the authenticated volume API. See [`VolumeFs`](#volumefs) for the operations.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumefs">VolumeFs</a></div>
+    <div className="msb-param-desc">Filesystem handle.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">path()</span>
+
+<Tooltip tip="Only local volumes expose a path on the computer running the SDK."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn path(&self) -> MicrosandboxResult<&Path>
+```
+
+<Accordion title="Example">
+
+```rust
+println!("{}", vol.path()?.display());
+```
+
+</Accordion>
+
+The host-side directory where this volume's data is stored.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">&amp;Path</span></div>
+    <div className="msb-param-desc">Host data directory, e.g. <code>~/.microsandbox/volumes/pip-cache/</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">disk_path()</span>
+
+```rust
+fn disk_path(&self) -> Option<PathBuf>
+```
+
+Host path to the managed raw disk image (`disk.raw`) for disk volumes. Returns `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;PathBuf&gt;</span></div>
+    <div className="msb-param-desc">Path to <code>disk.raw</code>, or <code>None</code> for directory volumes.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">capacity_bytes()</span>
+
+```rust
+fn capacity_bytes(&self) -> Option<u64>
+```
+
+Disk capacity in bytes for disk volumes. `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;u64&gt;</span></div>
+    <div className="msb-param-desc">Capacity in bytes, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">disk_format()</span>
+
+```rust
+fn disk_format(&self) -> Option<&str>
+```
+
+Disk image format for disk volumes (always `"raw"` for managed disk volumes). `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;str&gt;</span></div>
+    <div className="msb-param-desc">Format string, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">disk_fstype()</span>
+
+```rust
+fn disk_fstype(&self) -> Option<&str>
+```
+
+Inner disk filesystem type for disk volumes (always `"ext4"` for managed disk volumes). `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;str&gt;</span></div>
+    <div className="msb-param-desc">Filesystem type, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">backend_kind()</span>
+
+```rust
+fn backend_kind(&self) -> BackendKind
+```
+
+Which backend variant this volume is bound to: `Local` or `Cloud`.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">BackendKind</span></div>
+    <div className="msb-param-desc"><code>Local</code> or <code>Cloud</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">local()</span>
+
+<Tooltip tip="Returns state only for local-backed volumes; None on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn local(&self) -> Option<&VolumeLocalState>
+```
+
+Returns `Some` for local-backed volumes and `None` otherwise.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;VolumeLocalState&gt;</span></div>
+    <div className="msb-param-desc">Local state, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">vol.</span><span className="msb-hn">cloud()</span>
+
+<Tooltip tip="Returns state only for cloud-backed volumes; None on the local backend."><span className="msb-badge-cloud">Cloud-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn cloud(&self) -> Option<&VolumeCloudState>
+```
+
+Returns `Some` for cloud-backed volumes and `None` otherwise.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;VolumeCloudState&gt;</span></div>
+    <div className="msb-param-desc">Cloud state, or <code>None</code>.</div>
+  </div>
+</div>
+
+## VolumeHandle
+
+<p className="msb-backref">Returned by <a href="#volumeget">Volume::get()</a> · <a href="#volumelist">Volume::list()</a></p>
+
+A metadata and lifecycle handle for a named volume.
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">name()</span>
+
+```rust
+fn name(&self) -> &str
+```
+
+The unique name identifying this volume.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">kind()</span>
+
+```rust
+fn kind(&self) -> VolumeKind
+```
+
+The storage kind: [`Directory`](#volumekind) or [`Disk`](#volumekind).
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumekind">VolumeKind</a></div>
+    <div className="msb-param-desc">Storage kind.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">fs()</span>
+
+```rust
+fn fs(&self) -> VolumeFs<'_>
+```
+
+<Accordion title="Example">
+
+```rust
+let h = Volume::get("pip-cache").await?;
+let names = h.fs().list("/").await?;
+```
+
+</Accordion>
+
+Get a filesystem handle for reading and writing the volume's files directly, without a running sandbox. See [`VolumeFs`](#volumefs).
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumefs">VolumeFs</a></div>
+    <div className="msb-param-desc">Filesystem handle.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">remove()</span>
+
+```rust
+async fn remove(&self) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+Volume::get("pip-cache").await?.remove().await?;
+```
+
+</Accordion>
+
+Delete this volume and its contents. Locally the database record is removed first, then the directory.
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">used_bytes()</span>
+
+```rust
+fn used_bytes(&self) -> u64
+```
+
+Disk usage snapshot from when this handle was created. Not live; call [`Volume::get()`](#volumeget) again for a fresh reading.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">u64</span></div>
+    <div className="msb-param-desc">Bytes used at handle-creation time.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">quota_mib()</span>
+
+```rust
+fn quota_mib(&self) -> Option<u32>
+```
+
+Maximum storage in MiB, or `None` if unlimited.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;u32&gt;</span></div>
+    <div className="msb-param-desc">Quota in MiB, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">capacity_bytes()</span>
+
+```rust
+fn capacity_bytes(&self) -> Option<u64>
+```
+
+Disk capacity in bytes for disk volumes. `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;u64&gt;</span></div>
+    <div className="msb-param-desc">Capacity in bytes, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">disk_format()</span>
+
+```rust
+fn disk_format(&self) -> Option<&str>
+```
+
+Disk image format for disk volumes. `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;str&gt;</span></div>
+    <div className="msb-param-desc">Format string, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">disk_fstype()</span>
+
+```rust
+fn disk_fstype(&self) -> Option<&str>
+```
+
+Inner disk filesystem type for disk volumes. `None` for directory volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;str&gt;</span></div>
+    <div className="msb-param-desc">Filesystem type, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">disk_path()</span>
+
+```rust
+fn disk_path(&self) -> Option<PathBuf>
+```
+
+Host path to the managed raw disk image (`disk.raw`) for local disk volumes. `None` otherwise.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;PathBuf&gt;</span></div>
+    <div className="msb-param-desc">Path to <code>disk.raw</code>, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">labels()</span>
+
+```rust
+fn labels(&self) -> &[(String, String)]
+```
+
+Key-value labels for organizing and filtering volumes.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">&amp;[(String, String)]</span></div>
+    <div className="msb-param-desc">Label pairs.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">created_at()</span>
+
+```rust
+fn created_at(&self) -> Option<DateTime<Utc>>
+```
+
+When this volume was first created, if recorded.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;DateTime&lt;Utc&gt;&gt;</span></div>
+    <div className="msb-param-desc">Creation timestamp, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">backend_kind()</span>
+
+```rust
+fn backend_kind(&self) -> BackendKind
+```
+
+Which backend variant this handle is bound to: `Local` or `Cloud`.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">BackendKind</span></div>
+    <div className="msb-param-desc"><code>Local</code> or <code>Cloud</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">local()</span>
+
+<Tooltip tip="Returns state only for local-backed volume handles; None on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn local(&self) -> Option<&VolumeHandleLocalState>
+```
+
+Returns `Some` for local-backed handles and `None` otherwise.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;VolumeHandleLocalState&gt;</span></div>
+    <div className="msb-param-desc">Local state, or <code>None</code>.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">cloud()</span>
+
+<Tooltip tip="Returns state only for cloud-backed volume handles; None on the local backend."><span className="msb-badge-cloud">Cloud-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn cloud(&self) -> Option<&VolumeHandleCloudState>
+```
+
+Returns `Some` for cloud-backed handles and `None` otherwise.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Option&lt;&amp;VolumeHandleCloudState&gt;</span></div>
+    <div className="msb-param-desc">Cloud state, or <code>None</code>.</div>
+  </div>
+</div>
+
+## VolumeFs
+
+Local operations remain confined to the opened volume directory, including symlink traversal, missing parents, streams, copy, rename, and recursive deletion. Paths that leave the volume return an error. A leading `/` denotes the volume root; valid in-volume parent components and symlinks keep their meaning. Removing or renaming the volume root is refused.
+
+<p className="msb-backref">Returned by <a href="#vol-fs">Volume::fs()</a> · <a href="#h-fs">VolumeHandle::fs()</a></p>
+
+Host-side filesystem operations for a named volume.
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">read()</span>
+
+```rust
+async fn read(&self, path: &str) -> MicrosandboxResult<Bytes>
+```
+
+<Accordion title="Example">
+
+```rust
+let data = vol.fs().read("/seed.txt").await?;
+```
+
+</Accordion>
+
+Read an entire file into memory as raw bytes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">File path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Bytes</span></div>
+    <div className="msb-param-desc">File contents.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">read_to_string()</span>
+
+```rust
+async fn read_to_string(&self, path: &str) -> MicrosandboxResult<String>
+```
+
+<Accordion title="Example">
+
+```rust
+let text = vol.fs().read_to_string("/seed.txt").await?;
+```
+
+</Accordion>
+
+Read an entire file into memory as a UTF-8 string.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">File path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">String</span></div>
+    <div className="msb-param-desc">File contents as UTF-8.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">read_stream()</span>
+
+```rust
+async fn read_stream(&self, path: &str) -> MicrosandboxResult<VolumeFsReadStream>
+```
+
+<Accordion title="Example">
+
+```rust
+let mut stream = vol.fs().read_stream("/model.bin").await?;
+while let Some(chunk) = stream.recv().await? {
+    // process chunk
+}
+```
+
+</Accordion>
+
+Open a file for streaming reads. Returns a [`VolumeFsReadStream`](#volumefsreadstream) that yields 64 KiB chunks, so large files don't have to be held in memory at once.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">File path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumefsreadstream">VolumeFsReadStream</a></div>
+    <div className="msb-param-desc">Chunked reader.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">write()</span>
+
+```rust
+async fn write(&self, path: &str, data: impl AsRef<[u8]>) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().write("/config/app.json", r#"{"ready":true}"#).await?;
+```
+
+</Accordion>
+
+Write data to a file, creating parent directories as needed. Overwrites if the file already exists.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">File path relative to the volume root.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>data</code><span className="msb-type">impl AsRef&lt;[u8]&gt;</span></div>
+    <div className="msb-param-desc">Bytes to write.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">write_stream()</span>
+
+```rust
+async fn write_stream(&self, path: &str) -> MicrosandboxResult<VolumeFsWriteSink>
+```
+
+<Accordion title="Example">
+
+```rust
+let mut sink = vol.fs().write_stream("/upload.bin").await?;
+sink.write(&chunk).await?;
+sink.close().await?;
+```
+
+</Accordion>
+
+Open a file for streaming writes. Returns a [`VolumeFsWriteSink`](#volumefswritesink) that accepts chunks of bytes. Creates parent directories as needed.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">File path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumefswritesink">VolumeFsWriteSink</a></div>
+    <div className="msb-param-desc">Chunked writer.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">list()</span>
+
+```rust
+async fn list(&self, path: &str) -> MicrosandboxResult<Vec<FsEntry>>
+```
+
+<Accordion title="Example">
+
+```rust
+for entry in vol.fs().list("/").await? {
+    println!("{} ({} bytes)", entry.path, entry.size);
+}
+```
+
+</Accordion>
+
+List the immediate children of a directory (non-recursive). Each entry includes the path, kind, size, permissions, and modification time.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Directory path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="/sdk/rust/filesystem#fsentry">Vec&lt;FsEntry&gt;</a></div>
+    <div className="msb-param-desc">Directory entries.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">mkdir()</span>
+
+```rust
+async fn mkdir(&self, path: &str) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().mkdir("/data/incoming").await?;
+```
+
+</Accordion>
+
+Create a directory and any missing parents.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Directory path relative to the volume root.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">remove()</span>
+
+```rust
+async fn remove(&self, path: &str) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().remove("/data/stale.tmp").await?;
+```
+
+</Accordion>
+
+Delete a single file. Use [`remove_dir()`](#fs-remove_dir) for directories.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">File path relative to the volume root.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">remove_dir()</span>
+
+```rust
+async fn remove_dir(&self, path: &str) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().remove_dir("/data/incoming").await?;
+```
+
+</Accordion>
+
+Remove a directory and its contents recursively. Targeting the volume root is rejected.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Directory path relative to the volume root.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">copy()</span>
+
+```rust
+async fn copy(&self, from: &str, to: &str) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().copy("/seed.txt", "/backup/seed.txt").await?;
+```
+
+</Accordion>
+
+Copy a file within the volume. Creates the destination's parent directories as needed.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>from</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Source path relative to the volume root.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>to</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Destination path relative to the volume root.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">rename()</span>
+
+```rust
+async fn rename(&self, from: &str, to: &str) -> MicrosandboxResult<()>
+```
+
+<Accordion title="Example">
+
+```rust
+vol.fs().rename("/tmp/out.txt", "/done/out.txt").await?;
+```
+
+</Accordion>
+
+Rename or move a file or directory. Creates the destination's parent directories as needed.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>from</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Source path relative to the volume root.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>to</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Destination path relative to the volume root.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">stat()</span>
+
+```rust
+async fn stat(&self, path: &str) -> MicrosandboxResult<FsMetadata>
+```
+
+<Accordion title="Example">
+
+```rust
+let meta = vol.fs().stat("/seed.txt").await?;
+println!("{} bytes", meta.size);
+```
+
+</Accordion>
+
+Get metadata for a file or directory: kind, size, permission bits, read-only flag, and timestamps.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="/sdk/rust/filesystem#fsmetadata">FsMetadata</a></div>
+    <div className="msb-param-desc">Entry metadata.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">exists()</span>
+
+```rust
+async fn exists(&self, path: &str) -> MicrosandboxResult<bool>
+```
+
+<Accordion title="Example">
+
+```rust
+if !vol.fs().exists("/seed.txt").await? {
+    vol.fs().write("/seed.txt", "hello").await?;
+}
+```
+
+</Accordion>
+
+Check whether a file or directory exists at the given path. Returns `false` rather than an error if the path is absent.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">&amp;str</span></div>
+    <div className="msb-param-desc">Path relative to the volume root.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">bool</span></div>
+    <div className="msb-param-desc"><code>true</code> if the path exists.</div>
+  </div>
+</div>
+
+## VolumeBuilder
+
+<p className="msb-backref">Returned by <a href="#volumebuilder">Volume::builder()</a></p>
+
+Builder for configuring a named volume.
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">directory()</span>
+
+```rust
+fn directory(self) -> Self
+```
+
+Create a directory-backed named volume (mounted through virtiofs). This is the default.
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">disk()</span>
+
+<Tooltip tip="Disk-kind volumes are not available on microsandbox cloud; use a directory-backed named volume."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn disk(self) -> Self
+```
+
+Create a raw ext4 disk-image named volume (mounted through virtio-blk). Requires [`.size()`](#volume_builder-size).
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">size()</span>
+
+<Tooltip tip="Disk-kind volumes are not available on microsandbox cloud; use a directory-backed named volume."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn size(self, size: impl Into<Mebibytes>) -> Self
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::size::SizeExt;
+
+let vol = Volume::builder("docker-data")
+    .disk()
+    .size(20.gib())
+    .create()
+    .await?;
+```
+
+</Accordion>
+
+Set the disk volume's capacity. Required for disk volumes; rejected for directory volumes. Accepts a bare `u32` (MiB) or a `SizeExt` helper such as `20.gib()`.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>size</code><span className="msb-type">impl Into&lt;Mebibytes&gt;</span></div>
+    <div className="msb-param-desc">Capacity in MiB.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">quota()</span>
+
+<Tooltip tip="On microsandbox cloud, quota must be a nonzero whole number of GiB."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn quota(self, size: impl Into<Mebibytes>) -> Self
+```
+
+Limit a directory volume's storage. Accepts a bare `u32` (MiB) or a `SizeExt` helper such as `1.gib()`. Omit for unlimited growth (the default). Rejected for disk volumes, which size up front via [`.size()`](#volume_builder-size).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>size</code><span className="msb-type">impl Into&lt;Mebibytes&gt;</span></div>
+    <div className="msb-param-desc">Quota in MiB.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">label()</span>
+
+```rust
+fn label(self, key: impl Into<String>, value: impl Into<String>) -> Self
+```
+
+Attach a key-value label for organizing and filtering volumes. Can be called multiple times.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>key</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Label key.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>value</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Label value.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">build()</span>
+
+<a id="vb-build"></a>
+
+```rust
+fn build(self) -> VolumeConfig
+```
+
+Materialize the [`VolumeConfig`](#volumespec) without creating the volume. Pass the result to [`Volume::create()`](#volumecreate) to provision it later.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volumespec">VolumeConfig</a></div>
+    <div className="msb-param-desc">The volume configuration.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">volume_builder.</span><span className="msb-hn">create()</span>
+
+<a id="vb-create"></a>
+
+```rust
+async fn create(self) -> MicrosandboxResult<Volume>
+```
+
+<Accordion title="Example">
+
+```rust
+let vol = Volume::builder("pip-cache")
+    .quota(1024)
+    .label("team", "ml")
+    .create()
+    .await?;
+```
+
+</Accordion>
+
+Create the volume on the active backend. Equivalent to `Volume::create(self.build())`.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#volume">Volume</a></div>
+    <div className="msb-param-desc">The created volume.</div>
+  </div>
+</div>
+
+## MountBuilder
+
+<p className="msb-backref">Used by <a href="/sdk/rust/sandbox#sandbox-volume">SandboxBuilder::volume()</a></p>
+
+Builder for configuring a sandbox volume mount.
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">bind()</span>
+
+<Tooltip tip="On microsandbox cloud, the host path resolves against your organization's host volume, not the computer running the SDK."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn bind(self, host: impl Into<PathBuf>) -> Self
+```
+
+Bind mount a host directory into the guest. Changes in the guest are reflected on the host and vice versa. The host path must be valid UTF-8 and must not contain `,`, `:`, or `;`.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>host</code><span className="msb-type">impl Into&lt;PathBuf&gt;</span></div>
+    <div className="msb-param-desc">Directory path on the host.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">named()</span>
+
+```rust
+fn named(self, name: impl Into<String>) -> Self
+```
+
+Mount a named volume created via [`Volume::create()`](#volumecreate). The volume must already exist. Persists across sandbox restarts and can be shared between sandboxes. For sandbox-time provisioning, use [`.named_with()`](#mount-named_with).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">named_with()</span>
+
+<Tooltip tip="On microsandbox cloud, create the named volume before mounting; create-on-mount, disk-kind, and size are not available."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```rust
+fn named_with(
+    self,
+    name: impl Into<String>,
+    f: impl FnOnce(NamedVolumeBuilder) -> NamedVolumeBuilder,
+) -> Self
+```
+
+<Accordion title="Example">
+
+```rust
+use microsandbox::size::SizeExt;
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .volume("/cache", |v| v.named_with("pip-cache", |n| n.ensure_exists()))
+    .volume("/var/lib/docker", |v| {
+        v.named_with("docker-data", |n| n.ensure_exists().disk().size(20.gib()))
+    })
+    .create()
+    .await?;
+```
+
+</Accordion>
+
+Mount a named volume with explicit sandbox-time existence behavior, configured via a [`NamedVolumeBuilder`](#namedvolumebuilder) closure. `existing` (the default) behaves like [`.named()`](#mount-named); `create` provisions the volume and fails if it already exists; `ensure_exists` provisions it if missing or reuses a compatible existing volume. The ensure-exists mode validates existing metadata and errors when the kind, quota, capacity, or explicitly requested labels differ; it does not mutate existing metadata.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>f</code><a className="msb-type" href="#namedvolumebuilder">FnOnce(NamedVolumeBuilder)</a></div>
+    <div className="msb-param-desc">Configure existence behavior and creation metadata.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">tmpfs()</span>
+
+```rust
+fn tmpfs(self) -> Self
+```
+
+Use an in-memory filesystem. Contents are discarded when the sandbox stops. Good for scratch space, temp files, and build artifacts. Cap its size with [`.size()`](#mb-size).
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">disk()</span>
+
+<Tooltip tip="On microsandbox cloud, the disk-image path resolves against your organization's host volume, not the computer running the SDK or CLI."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+<a id="mb-disk"></a>
+
+```rust
+fn disk(self, host: impl Into<PathBuf>) -> Self
+```
+
+Mount a host disk-image file as a virtio-blk device at the guest path. The format defaults from the file extension (`.qcow2`, `.vmdk`; anything else is `Raw`). Override with [`.format()`](#mount-format).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>host</code><span className="msb-type">impl Into&lt;PathBuf&gt;</span></div>
+    <div className="msb-param-desc">Disk image path on the host.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">format()</span>
+
+```rust
+fn format(self, format: DiskImageFormat) -> Self
+```
+
+Override the disk-image format for a [`.disk()`](#mb-disk) mount. Valid only with `.disk()`; calling it on a bind, named, or tmpfs mount errors when the `SandboxBuilder` is finalized.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>format</code><a className="msb-type" href="#diskimageformat">DiskImageFormat</a></div>
+    <div className="msb-param-desc">Disk image format.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">fstype()</span>
+
+```rust
+fn fstype(self, fstype: impl Into<String>) -> Self
+```
+
+Set the inner filesystem type for a [`.disk()`](#mb-disk) mount, for example `"ext4"`. If omitted, agentd probes `/proc/filesystems` and uses the first type that mounts cleanly. Empty values and the separators `,`, `;`, `:`, `=` are rejected. Valid only with `.disk()`.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>fstype</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Inner filesystem type.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">readonly()</span>
+
+```rust
+fn readonly(self) -> Self
+```
+
+Prevent writes to this mount. Enforced both at the host (virtiofs server rejects writes) and in the guest (the kernel returns `EROFS`).
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">noexec()</span>
+
+```rust
+fn noexec(self) -> Self
+```
+
+Prevent direct execution of files on this mount. Interpreters can still read scripts from the mount, such as `sh /mnt/script.sh`, because the interpreter binary executes from a different filesystem.
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">nosuid()</span>
+
+```rust
+fn nosuid(self) -> Self
+```
+
+Ignore setuid and setgid privilege elevation from files on this mount.
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">nodev()</span>
+
+```rust
+fn nodev(self) -> Self
+```
+
+Ignore device files on this mount.
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">stat_virtualization()</span>
+
+```rust
+fn stat_virtualization(self, policy: StatVirtualization) -> Self
+```
+
+Set the guest stat virtualization policy for a virtiofs-backed mount. Default: [`Strict`](#statvirtualization). Valid only for bind and directory-backed named-volume mounts. Tmpfs and disk-image mounts are rejected when the mount is built; disk-backed named volumes are rejected once the backing volume kind is known during sandbox create or start.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>policy</code><a className="msb-type" href="#statvirtualization">StatVirtualization</a></div>
+    <div className="msb-param-desc">Stat virtualization policy.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">host_permissions()</span>
+
+```rust
+fn host_permissions(self, policy: HostPermissions) -> Self
+```
+
+Set the host permission propagation policy for a virtiofs-backed mount. Default: [`Private`](#hostpermissions). Valid only for bind and directory-backed named-volume mounts. Combining [`StatVirtualization::Off`](#statvirtualization) with [`HostPermissions::Mirror`](#hostpermissions) is rejected, since with no overlay the guest chmod already hits the host inode and `Mirror` would be a no-op.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>policy</code><a className="msb-type" href="#hostpermissions">HostPermissions</a></div>
+    <div className="msb-param-desc">Host permission propagation policy.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">owner()</span>
+
+```rust
+fn owner(self, uid: u32, gid: u32) -> Self
+```
+
+Present host files without a per-file stat override as the specified guest owner. Existing per-file overrides still take precedence, and the host inode is not changed. Valid only for bind and directory-backed named-volume mounts with stat virtualization enabled; tmpfs, disk images, disk-backed named volumes, and `StatVirtualization::Off` are rejected.
+
+```rust
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .volume("/workspace", |mount| mount.bind("./workspace").owner(1000, 1000))
+    .create()
+    .await?;
+```
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">size()</span>
+
+<a id="mb-size"></a>
+
+```rust
+fn size(self, size: impl Into<Mebibytes>) -> Self
+```
+
+Set the size limit for a [`.tmpfs()`](#mount-tmpfs) mount. Accepts a bare `u32` (MiB) or a `SizeExt` helper such as `1.gib()`. Valid only for tmpfs mounts.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>size</code><span className="msb-type">impl Into&lt;Mebibytes&gt;</span></div>
+    <div className="msb-param-desc">Size limit in MiB.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">mount.</span><span className="msb-hn">build()</span>
+
+<a id="mb-build"></a>
+
+```rust
+fn build(self) -> MicrosandboxResult<VolumeMount>
+```
+
+Validate and materialize the mount. Usually called internally by `SandboxBuilder::volume`; call it directly only when assembling a [`VolumeMount`](#mountbuilder) by hand. Errors when no mount kind is set, the guest path is not absolute or is `/`, or a kind-specific option was set on the wrong mount kind.
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">VolumeMount</span></div>
+    <div className="msb-param-desc">Validated mount specification.</div>
+  </div>
+</div>
+
+## NamedVolumeBuilder
+
+<p className="msb-backref">Used by <a href="#mount-named_with">MountBuilder::named_with()</a></p>
+
+Sub-builder for [`MountBuilder::named_with()`](#mount-named_with). Selects the sandbox-time existence behavior and, for `create` / `ensure_exists`, the creation metadata. Defaults to `existing` and directory-backed.
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">existing()</span>
+
+<a id="nv-existing"></a>
+
+```rust
+fn existing(self) -> Self
+```
+
+Require the named volume to already exist. This is the default.
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">create()</span>
+
+<a id="nv-create"></a>
+
+```rust
+fn create(self) -> Self
+```
+
+Create the named volume at sandbox launch and fail if it already exists.
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">ensure_exists()</span>
+
+<a id="nv-ensure_exists"></a>
+
+```rust
+fn ensure_exists(self) -> Self
+```
+
+Create the named volume if it is missing, or reuse a compatible existing volume. Errors if an existing volume's kind, quota, capacity, or explicitly requested labels differ.
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">name()</span>
+
+<a id="nv-name"></a>
+
+```rust
+fn name(self, name: impl Into<String>) -> Self
+```
+
+Override the volume name passed to [`named_with()`](#mount-named_with).
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>name</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Volume name.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">directory()</span>
+
+<a id="nv-directory"></a>
+
+```rust
+fn directory(self) -> Self
+```
+
+Use directory-backed storage for a created volume. This is the default. Clears any previously set disk capacity.
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">disk()</span>
+
+<Tooltip tip="Disk-kind volumes are not available on microsandbox cloud; use a directory-backed named volume."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+<a id="nv-disk"></a>
+
+```rust
+fn disk(self) -> Self
+```
+
+Use raw ext4 disk-image storage for a created volume. Requires [`.size()`](#nv-size). Clears any previously set quota.
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">size()</span>
+
+<Tooltip tip="Disk-kind volumes are not available on microsandbox cloud; use a directory-backed named volume."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+<a id="nv-size"></a>
+
+```rust
+fn size(self, size: impl Into<Mebibytes>) -> Self
+```
+
+Set disk capacity for a created disk volume. Accepts a bare `u32` (MiB) or a `SizeExt` helper.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>size</code><span className="msb-type">impl Into&lt;Mebibytes&gt;</span></div>
+    <div className="msb-param-desc">Capacity in MiB.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">quota()</span>
+
+<Tooltip tip="On microsandbox cloud, quota must be a nonzero whole number of GiB."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+<a id="nv-quota"></a>
+
+```rust
+fn quota(self, size: impl Into<Mebibytes>) -> Self
+```
+
+Set a storage quota for a created directory volume. Accepts a bare `u32` (MiB) or a `SizeExt` helper.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>size</code><span className="msb-type">impl Into&lt;Mebibytes&gt;</span></div>
+    <div className="msb-param-desc">Quota in MiB.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">named.</span><span className="msb-hn">label()</span>
+
+<a id="nv-label"></a>
+
+```rust
+fn label(self, key: impl Into<String>, value: impl Into<String>) -> Self
+```
+
+Attach a label to a newly-created volume. For `ensure_exists`, requested labels must match the existing volume. Can be called multiple times.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>key</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Label key.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>value</code><span className="msb-type">impl Into&lt;String&gt;</span></div>
+    <div className="msb-param-desc">Label value.</div>
+  </div>
+</div>
+
+## VolumeFsReadStream
+
+<p className="msb-backref">Returned by <a href="#fs-read_stream">VolumeFs::read_stream()</a></p>
+
+A streaming reader for file data from a local volume directory.
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">recv()</span>
+
+```rust
+recv()
+```
+
+Next chunk; `None` at EOF
+
+<p className="msb-label">Returns</p>
+
+`Option<Bytes>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">collect()</span>
+
+```rust
+collect()
+```
+
+Read the rest into one buffer
+
+<p className="msb-label">Returns</p>
+
+`Bytes`
+
+## VolumeFsWriteSink
+
+<p className="msb-backref">Returned by <a href="#fs-write_stream">VolumeFs::write_stream()</a></p>
+
+A streaming writer for file data to a local volume directory.
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">write()</span>
+
+```rust
+write(data)
+```
+
+Append a chunk
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">close()</span>
+
+```rust
+close()
+```
+
+Flush and close
+
+## Types
+
+### VolumeKind
+
+Storage kind for a named volume.
+
+<p className="msb-backref">Returned by <a href="#vol-kind">Volume::kind()</a> · <a href="#h-kind">VolumeHandle::kind()</a></p>
+
+| Variant | Description |
+|---------|-------------|
+| `Directory` | Directory-backed volume mounted through virtiofs |
+| `Disk` | Raw ext4 disk-image volume mounted through virtio-blk |
+
+### VolumeSpec
+
+Configuration for creating a named volume. Re-exported as both `VolumeSpec` and the alias `VolumeConfig`.
+
+<p className="msb-backref">Used by <a href="#volumecreate">Volume::create()</a> · returned by <a href="#vb-build">VolumeBuilder::build()</a></p>
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Volume name |
+| `kind` | [`VolumeKind`](#volumekind) | Storage kind |
+| `quota_mib` | `Option<u32>` | Size quota in MiB; `None` is unlimited |
+| `capacity_mib` | `Option<u32>` | Disk capacity in MiB; required for disk volumes |
+| `labels` | `Vec<(String, String)>` | Organization labels |
+
+### MountOptions
+
+Guest mount behavior shared by every mount kind. Set via the [`MountBuilder`](#mountbuilder) toggles; all fields default to `false`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `readonly` | `bool` | Guest writes fail; virtiofs mounts also reject host-side writes |
+| `noexec` | `bool` | Direct execution from the mount is disabled |
+| `nosuid` | `bool` | setuid/setgid elevation from files on the mount is ignored |
+| `nodev` | `bool` | Device files on the mount are ignored |
+| `override_uid` | `Option<u32>` | Guest uid fallback for host files without a per-file override; set together with `override_gid` via [`MountBuilder::owner()`](#mount-owner) |
+| `override_gid` | `Option<u32>` | Guest gid fallback for host files without a per-file override; set together with `override_uid` via [`MountBuilder::owner()`](#mount-owner) |
+
+### StatVirtualization
+
+Stat virtualization policy for a virtiofs-backed mount. Default: `Strict`. Set via [`MountBuilder::stat_virtualization()`](#mount-stat_virtualization).
+
+| Variant | Description |
+|---------|-------------|
+| `Strict` | Fail-closed: probe the host backing path; require xattr support |
+| `Relaxed` | Opportunistic: apply the overlay when present; tolerate missing xattr support |
+| `Off` | Literal host metadata: do not read or apply the override xattr |
+
+### HostPermissions
+
+Host permission propagation policy for a virtiofs-backed mount. Default: `Private`. Set via [`MountBuilder::host_permissions()`](#mount-host_permissions).
+
+| Variant | Description |
+|---------|-------------|
+| `Private` | Guest chmod stays in the metadata overlay only |
+| `Mirror` | Mirror ordinary rwx bits for files and directories to the host inode |
+
+### DiskImageFormat
+
+Disk image format for virtio-blk root filesystems and volume mounts. Used by [`MountBuilder::format()`](#mount-format).
+
+| Variant | Description |
+|---------|-------------|
+| `Qcow2` | QEMU Copy-on-Write v2 |
+| `Raw` | Raw disk image |
+| `Vmdk` | VMware Disk (FLAT/ZERO only, no delta links) |
+
+### NamedVolumeMode
+
+Sandbox-time behavior for a named volume mount, chosen via [`NamedVolumeBuilder`](#namedvolumebuilder).
+
+| Variant | Description |
+|---------|-------------|
+| `Existing` | Require the named volume to already exist (default) |
+| `Create` | Create the named volume and fail if it already exists |
+| `EnsureExists` | Ensure the volume exists, or reuse a compatible existing one |

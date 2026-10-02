@@ -1,0 +1,156 @@
+---
+title: Filesystem
+description: Read and write files inside a running sandbox
+keywords: ["sandbox filesystem", "read files", "write files", "file operations"]
+icon: "folder-open"
+---
+
+The filesystem API lets you read, write, and manage files inside a sandbox without mounting volumes or SSH. It uses the same channel as command execution, so it doesn't touch the sandbox's network.
+
+Handy for pushing generated code into a sandbox, pulling back results, or inspecting logs without having to pre-mount a shared directory.
+
+## Write a file
+
+<CodeGroup>
+```typescript TypeScript
+await sb.fs().write("/app/config.json", '{"debug": true}');
+```
+
+```rust Rust
+sb.fs().write("/app/config.json", r#"{"debug": true}"#).await?;
+```
+
+```python Python
+await sb.fs.write("/app/config.json", b'{"debug": true}')
+```
+
+```go Go
+err := sb.FS().WriteString(ctx, "/app/config.json", `{"debug": true}`)
+```
+
+</CodeGroup>
+
+## Read a file
+
+<CodeGroup>
+```typescript TypeScript
+const content = await sb.fs().readToString("/app/config.json");
+```
+
+```rust Rust
+let content = sb.fs().read_to_string("/app/config.json").await?;
+```
+
+```python Python
+content = await sb.fs.read_text("/app/config.json")
+```
+
+```go Go
+content, err := sb.FS().ReadString(ctx, "/app/config.json")
+```
+
+</CodeGroup>
+
+## List a directory
+
+<CodeGroup>
+```typescript TypeScript
+const entries = await sb.fs().list("/app");
+for (const entry of entries) {
+    console.log(`${entry.path}: ${entry.kind}`);
+}
+```
+
+```rust Rust
+let entries = sb.fs().list("/app").await?;
+for entry in entries {
+    println!("{}: {:?}", entry.path, entry.kind);
+}
+```
+
+```python Python
+entries = await sb.fs.list("/app")
+for entry in entries:
+    print(f"{entry.path}: {entry.kind}")
+```
+
+```go Go
+entries, err := sb.FS().List(ctx, "/app")
+for _, entry := range entries {
+    fmt.Printf("%s: %s\n", entry.Path, entry.Kind)
+}
+```
+
+</CodeGroup>
+
+## Stream large files
+
+For files too large to fit in memory, use streaming. Data is transferred in chunks of approximately 3 MiB each.
+
+<CodeGroup>
+```typescript TypeScript
+const stream = await sb.fs().readStream("/app/data.bin");
+for await (const chunk of stream) {
+    processChunk(chunk); // chunk is a Uint8Array
+}
+```
+
+```rust Rust
+let mut stream = sb.fs().read_stream("/app/data.bin").await?;
+while let Some(chunk) = stream.recv().await? {
+    process(&chunk);
+}
+```
+
+```python Python
+stream = await sb.fs.read_stream("/app/data.bin")
+async for chunk in stream:
+    process(chunk)
+```
+
+```go Go
+stream, err := sb.FS().ReadStream(ctx, "/app/data.bin")
+for {
+    chunk, err := stream.Recv(ctx)
+    if err != nil {
+        return err
+    }
+    if chunk == nil {
+        break
+    }
+    process(chunk)
+}
+```
+
+</CodeGroup>
+
+## Copy from host
+
+Copy a file from the host machine into the sandbox in a single call.
+
+<CodeGroup>
+```typescript TypeScript
+await sb.fs().copyFromHost("./local-file.txt", "/app/remote-file.txt");
+```
+
+```rust Rust
+sb.fs().copy_from_host("./local-file.txt", "/app/remote-file.txt").await?;
+```
+
+```python Python
+await sb.fs.copy_from_host("./local-file.txt", "/app/remote-file.txt")
+```
+
+```go Go
+err := sb.FS().CopyFromHost(ctx, "./local-file.txt", "/app/remote-file.txt")
+```
+
+</CodeGroup>
+
+<Tip>
+  If you need to transfer many files at once, consider using a [bind-mounted volume](/sandboxes/volumes) instead. Volumes give the guest direct filesystem access, whereas the filesystem API transfers each file individually. For bulk operations, volumes are significantly faster.
+</Tip>
+
+## Reference
+
+For exact filesystem APIs, see [TypeScript](/sdk/typescript/filesystem), [Rust](/sdk/rust/filesystem), [Python](/sdk/python/filesystem), or [Go](/sdk/go/filesystem). For host-to-sandbox copies, see [`msb copy`](/cli/sandbox-commands#msb-copy).

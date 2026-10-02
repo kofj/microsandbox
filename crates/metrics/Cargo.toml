@@ -1,0 +1,23 @@
+[package]
+name = "microsandbox-metrics"
+description = "Shared-memory live metrics registry for microsandbox."
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+edition.workspace = true
+
+[lib]
+name = "microsandbox_metrics"
+path = "lib/lib.rs"
+
+[dependencies]
+chrono.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,457 @@
+---
+title: Error handling
+description: Error matching and resource cleanup patterns
+icon: "triangle-exclamation"
+---
+
+TypeScript, Rust, Python, and Go surface typed errors so you can match specific failure modes instead of parsing strings. TypeScript exposes a dedicated subclass per variant (use `instanceof`), Rust has an `Error` enum, Python provides dedicated exception classes, and Go provides an `*Error` value with an `ErrorKind` discriminator matched via `m.IsKind(err, kind)` or `errors.As`. Ruby currently exposes `Microsandbox::Error`; where no dedicated subclass exists, its reference documents the stable message contract explicitly.
+
+## Matching errors
+
+<CodeGroup>
+```typescript TypeScript
+import {
+    ExecTimeoutError,
+    RuntimeError,
+    Sandbox,
+} from "microsandbox";
+
+const sb = await Sandbox.builder("worker")
+    .image("python")
+    .connectOrCreate();
+
+try {
+    const output = await sb.exec("python", ["script.py"]);
+    if (!output.success) {
+        console.error(`Failed (exit ${output.code}):`, output.stderr());
+    }
+} catch (e) {
+    if (e instanceof ExecTimeoutError) {
+        console.error(`Timed out after ${e.timeoutMs}ms`);
+    } else if (e instanceof RuntimeError) {
+        console.error("Runtime:", e.message);
+    } else {
+        throw e;
+    }
+}
+```
+
+```rust Rust
+use microsandbox::{Sandbox, Error};
+
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .connect_or_create()
+    .await?;
+
+match sb.exec("python", ["script.py"]).await {
+    Ok(output) if output.status().success => {
+        println!("{}", output.stdout()?);
+    }
+    Ok(output) => {
+        eprintln!("Exit {}: {}", output.status().code, output.stderr()?);
+    }
+    Err(Error::ExecTimeout) => eprintln!("Timed out"),
+    Err(Error::Runtime(msg)) => eprintln!("Runtime: {msg}"),
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import ExecTimeoutError, Sandbox
+
+sb = await Sandbox.connect_or_create("worker", image="python")
+
+try:
+    output = await sb.exec("python", ["script.py"])
+    if not output.success:
+        print(f"Exit {output.exit_code}: {output.stderr_text}")
+except ExecTimeoutError:
+    print("Timed out")
+```
+
+```go Go
+import (
+    "context"
+    "errors"
+    "log"
+
+    m "github.com/superradcompany/microsandbox/sdk/go"
+)
+
+sb, err := m.ConnectOrCreateSandbox(ctx, "worker", m.WithImage("python"))
+if err != nil {
+    log.Fatal(err)
+}
+
+out, err := sb.Exec(ctx, "python", []string{"script.py"})
+switch {
+case err == nil && !out.Success():
+    log.Printf("exit %d: %s", out.ExitCode(), out.Stderr())
+case m.IsKind(err, m.ErrExecTimeout):
+    log.Println("timed out")
+case err != nil:
+    // errors.As for deeper inspection.
+    var me *m.Error
+    if errors.As(err, &me) {
+        log.Printf("kind=%s message=%s", me.Kind, me.Message)
+    }
+}
+```
+
+```ruby Ruby
+require "microsandbox"
+
+sb = Microsandbox::Sandbox.connect_or_create("worker", image: "python")
+
+begin
+  output = sb.exec("python", ["script.py"])
+  warn "Exit #{output.exit_code}: #{output.stderr}" unless output.success?
+rescue Microsandbox::Error => error
+  warn error.message
+end
+```
+
+</CodeGroup>
+
+## Spawn-time exec failures
+
+`exec()` distinguishes between:
+
+- **A program that ran and exited non-zero**: the call returns an `ExecOutput` with a non-zero `code`. This is *not* an error in the SDK sense; it's a normal result.
+- **A program that never started**: the binary doesn't exist, isn't executable, the working directory is unreachable, etc. The call returns or raises an SDK error.
+
+Rust exposes a structured `ExecFailed` payload, and Go exposes the same detail on streaming execution events. Common failure kinds include `NotFound` (binary missing on `PATH`), `PermissionDenied`, `NotExecutable`, `BadCwd`, `BadArgs`, `ResourceLimit`, `UserSetupFailed`, `OutOfMemory`, `PtySetupFailed`, and `Other`.
+
+<CodeGroup>
+```typescript TypeScript
+try {
+    const output = await sb.exec("nonexistent");
+    // program ran, check output.success / output.code
+} catch (e) {
+    console.error("Program could not be started:", e);
+}
+```
+
+```rust Rust
+use microsandbox::{protocol::exec::ExecFailureKind, Error};
+
+match sb.exec("nonexistent", []).await {
+    Ok(output) => { /* program ran, check output.status() */ }
+    Err(Error::ExecFailed(payload)) => {
+        match payload.kind {
+            ExecFailureKind::NotFound => {
+                eprintln!("Binary not found on PATH: {}", payload.message);
+            }
+            ExecFailureKind::PermissionDenied => {
+                eprintln!("Not executable (chmod +x?): {}", payload.message);
+            }
+            kind => {
+                eprintln!("Spawn failed ({:?}): {}", kind, payload.message);
+            }
+        }
+        // payload.errno, payload.errno_name, payload.stage are also available
+    }
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import MicrosandboxError
+
+try:
+    output = await sb.exec("nonexistent")
+    # program ran, check output.success / output.exit_code
+except MicrosandboxError as e:
+    print(f"Program could not be started: {e}")
+```
+
+```ruby Ruby
+require "microsandbox"
+
+begin
+  output = sandbox.exec("nonexistent")
+  # program ran, check output.success / output.exit_code
+rescue Microsandbox::Error => e
+  warn "Program could not be started: #{e.message}"
+end
+```
+
+```go Go
+// Streaming exec surfaces spawn-failure detail via ExecEventFailed.
+h, err := sb.ExecStream(ctx, "nonexistent", nil)
+if err != nil {
+    return err
+}
+defer h.Close()
+
+for {
+    ev, err := h.Recv(ctx)
+    if err != nil {
+        return err
+    }
+    switch ev.Kind {
+    case m.ExecEventExited:
+        // Program ran; inspect ev.ExitCode.
+    case m.ExecEventFailed:
+        f := ev.Failure // *m.ExecFailure
+        switch f.Kind {
+        case "not_found":
+            log.Printf("Binary not on PATH: %s", f.Message)
+        case "permission_denied":
+            log.Printf("Not executable (chmod +x?): %s", f.Message)
+        default:
+            log.Printf("Spawn failed (%s): %s", f.Kind, f.Message)
+        }
+        // f.Errno (*int), f.ErrnoName, f.Path are also available.
+    case m.ExecEventDone:
+        return nil
+    }
+}
+```
+</CodeGroup>
+
+The CLI maps these kinds to POSIX-style exit codes: `127` for `NotFound`, `126` for `PermissionDenied` and `NotExecutable`, and `1` otherwise.
+
+## Name conflicts
+
+Creating a sandbox with a name that's already in use (and without `replace`) surfaces a typed error you can branch on to decide whether to recover (resume the existing one, regenerate the name, etc.).
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox, SandboxAlreadyExistsError } from "microsandbox";
+
+try {
+    const sb = await Sandbox.builder("worker").image("alpine").create();
+} catch (e) {
+    if (e instanceof SandboxAlreadyExistsError) {
+        console.error("sandbox already exists; resume or pass replace()");
+    } else {
+        throw e;
+    }
+}
+```
+
+```rust Rust
+use microsandbox::{Error, Sandbox};
+
+match Sandbox::builder("worker").image("alpine").create().await {
+    Ok(sb) => { /* ... */ }
+    Err(Error::SandboxAlreadyExists(name)) => {
+        eprintln!("sandbox {name} already exists; resume or pass .replace()");
+    }
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import Sandbox, SandboxAlreadyExistsError
+
+try:
+    sb = await Sandbox.create("worker", image="alpine")
+except SandboxAlreadyExistsError:
+    print("sandbox already exists; resume or pass replace=True")
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("alpine"))
+if m.IsKind(err, m.ErrSandboxAlreadyExists) {
+    log.Println("sandbox already exists; resume or pass WithReplace()")
+}
+```
+
+```ruby Ruby
+begin
+  sb = Microsandbox::Sandbox.create("worker", image: "alpine")
+rescue Microsandbox::Error => error
+  raise unless error.message.include?("already exists")
+  warn "sandbox already exists; use connect_or_create to reuse it or replace: true to recreate it"
+end
+```
+
+</CodeGroup>
+
+Use `connect_or_create` and its language-specific equivalents to reuse the existing sandbox without changing its configuration. Pass `replace()` / `replace=True` / `replace: true` / `--replace` / `WithReplace()` only when you intend to stop the existing sandbox and create a new one. See [Naming conflicts](/sandboxes/overview#naming-conflicts) for the grace-period setting.
+
+## When a sandbox object is stale
+
+A `Sandbox` or `SandboxHandle` keeps the ID of the exact sandbox it represents. If that sandbox is removed and the name is reused, lifecycle methods refuse to act on the replacement and return a typed error.
+
+<CodeGroup>
+```typescript TypeScript
+import { SandboxReplacedError } from "microsandbox";
+
+try {
+  await staleHandle.destroy();
+} catch (error) {
+  if (!(error instanceof SandboxReplacedError)) throw error;
+}
+```
+
+```rust Rust
+match stale_handle.destroy().await {
+    Err(Error::SandboxReplaced { expected, actual, .. }) => {
+        eprintln!("refusing stale operation: {expected} -> {actual}");
+    }
+    result => result?,
+}
+```
+
+```python Python
+from microsandbox import SandboxReplacedError
+
+try:
+    await stale_handle.destroy()
+except SandboxReplacedError:
+    pass
+```
+
+```go Go
+if err := staleHandle.Destroy(ctx); m.IsKind(err, m.ErrSandboxReplaced) {
+    log.Println("refusing stale lifecycle operation")
+}
+```
+
+```ruby Ruby
+begin
+  stale_handle.destroy
+rescue Microsandbox::Error => error
+  raise unless error.message.include?("was replaced")
+end
+```
+</CodeGroup>
+
+Ruby does not yet expose a dedicated stale-identity subclass. Until it does, `Microsandbox::Error` with the stable `was replaced` message is the Ruby-specific contract; the operation still refuses to act on the replacement.
+
+## Stop observation timeouts
+
+On Local, a graceful-stop timeout causes the SDK to force-kill the sandbox. On Cloud, the same timeout only limits how long the SDK waits: the accepted server-side stop is not cancelled and may still complete. Cloud reports this with `SandboxStopTimedOutError` in TypeScript and Python, `Error::SandboxStopTimedOut` in Rust, and `ErrSandboxStopTimedOut` in Go. Ruby currently raises `Microsandbox::Error` with a message explaining that the accepted stop may still complete.
+
+After a Cloud timeout, poll the sandbox status or call the wait-until-stopped method if the caller still needs confirmation. Calling `request_stop` first is useful when the application wants to submit the stop and control its own observation deadline.
+
+## Sandbox start failures
+
+When a sandbox process exits before the agent relay is ready, creation returns or raises an SDK error. Rust exposes a structured `BootStart` payload with the failure stage and underlying message.
+
+<CodeGroup>
+```typescript TypeScript
+import { Sandbox } from "microsandbox";
+
+try {
+    const sb = await Sandbox.builder("svc").image("alpine").create();
+} catch (e) {
+    console.error("Sandbox failed to start:", e);
+}
+```
+
+```rust Rust
+use microsandbox::{Error, Sandbox};
+
+match Sandbox::builder("svc").image("alpine").create().await {
+    Ok(sb) => { /* ... */ }
+    Err(Error::BootStart { name, err }) => {
+        eprintln!("Sandbox {name:?} failed at stage {:?}: {}", err.stage, err.message);
+    }
+    Err(e) => return Err(e),
+}
+```
+
+```python Python
+from microsandbox import MicrosandboxError, Sandbox
+
+try:
+    sb = await Sandbox.create("svc", image="alpine")
+except MicrosandboxError as e:
+    print(f"Sandbox failed to start: {e}")
+```
+
+```go Go
+_, err := m.CreateSandbox(ctx, "svc", m.WithImage("alpine"))
+if err != nil {
+    log.Printf("sandbox failed to start: %v", err)
+}
+```
+
+```ruby Ruby
+require "microsandbox"
+
+begin
+  sandbox = Microsandbox::Sandbox.create("svc", image: "alpine")
+rescue Microsandbox::Error => e
+  warn "Sandbox failed to start: #{e.message}"
+end
+```
+</CodeGroup>
+
+The CLI prints the startup failure before any captured log output so the immediate cause stays visible.
+
+## Resource cleanup
+
+<Tooltip tip="TypeScript await using and Rust drop do not stop microsandbox cloud sandboxes, because cloud handles do not own the host process; call stop() or remove() explicitly."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Sandboxes hold compute resources, so release them when done. In TypeScript, prefer `await using` (Node 22+) which calls `Sandbox.stop()` automatically when the binding leaves scope. In Rust, `Drop` handles cleanup when the sandbox goes out of scope. In Go, pair every `CreateSandbox` with a `defer` that calls `Stop` + `Close`.
+
+<CodeGroup>
+```typescript TypeScript
+async function runTemporary(): Promise<string> {
+    // `await using` calls Sandbox.stop() when the binding leaves scope.
+    await using sb = await Sandbox.builder("temp")
+        .image("python")
+        .replace()
+        .create();
+
+    const out = await sb.exec("python", ["-c", "print('hello')"]);
+    return out.stdout();
+}
+```
+
+```rust Rust
+use microsandbox::Sandbox;
+
+// Sandbox implements Drop, so resources are released when `sb` goes out of scope.
+// For explicit control, call stop() or kill().
+{
+    let sb = Sandbox::builder("temp")
+        .image("python")
+        .create()
+        .await?;
+
+    let output = sb.exec("python", ["-c", "print('hello')"]).await?;
+} // sb is dropped here, resources are cleaned up
+```
+
+```python Python
+# Use async context manager: auto-kills and removes on exit.
+async with await Sandbox.create("temp", image="python") as sb:
+    output = await sb.exec("python", ["-c", "print('hello')"])
+    print(output.stdout_text)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "temp",
+    m.WithImage("python"),
+    m.WithReplace(),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer func() {
+    stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    _ = sb.Stop(stopCtx)
+    _ = sb.Close()
+}()
+
+out, _ := sb.Exec(ctx, "python", []string{"-c", "print('hello')"})
+fmt.Println(out.Stdout())
+```
+
+```ruby Ruby
+Microsandbox::Sandbox.with("temp", image: "python", replace: true) do |sandbox|
+  output = sandbox.exec("python", ["-c", "print('hello')"])
+  puts output.stdout
+end
+```
+
+</CodeGroup>

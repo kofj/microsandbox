@@ -1,0 +1,79 @@
+//! Entity definition for the `snapshot_index` table.
+//!
+//! This table is a local cache that mirrors snapshot artifacts on disk.
+//! The artifact (`snapshot.json` + upper file) is the source of truth;
+//! these rows exist for fast queries and parent-edge bookkeeping.
+
+use sea_orm::entity::prelude::*;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// The snapshot-index entity model.
+#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+#[sea_orm(table_name = "snapshot_index")]
+pub struct Model {
+    /// Descriptor digest, shared by identical artifacts in different local groups.
+    pub digest: String,
+    /// Stable opaque snapshot identity.
+    pub snapshot_id: Option<String>,
+    /// SHA-256 of canonical descriptor bytes.
+    pub descriptor_digest: Option<String>,
+    /// Convenience name, unique within its group directory.
+    pub name: Option<String>,
+    /// Local group label, absent for explicitly opened ungrouped artifacts.
+    pub group_name: Option<String>,
+    /// Absolute group directory, which scopes member aliases across storage roots.
+    pub group_path: Option<String>,
+    /// Stable identity of the parent snapshot, or NULL for a root.
+    pub parent_digest: Option<String>,
+    /// Snapshot payload scope (`disk` or `full`).
+    pub scope: String,
+    /// Closed descriptor state discriminant (`file` or `checkpoint`).
+    pub state_kind: String,
+    /// Human-readable image reference.
+    pub image_ref: String,
+    /// OCI manifest digest of the image.
+    pub image_manifest_digest: String,
+    /// On-disk format of the upper layer (`raw` or `qcow2`).
+    pub format: Option<String>,
+    /// Filesystem type inside the upper (e.g. `ext4`).
+    pub fstype: Option<String>,
+    /// Checkpoint-manifest digest for checkpoint state.
+    pub checkpoint_manifest_digest: Option<String>,
+    /// Absolute path to the artifact directory on this host.
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub artifact_path: String,
+    /// Apparent size of the upper file in bytes.
+    pub size_bytes: Option<i64>,
+    /// Locality of the state closure (`embedded` or `linked`).
+    pub locality: String,
+    /// Host-local storage/provider binding identifier.
+    pub storage_binding_id: Option<String>,
+    /// Rebuildable closure availability projection.
+    pub availability: String,
+    /// Artifact migration status projection.
+    pub migration_state: String,
+    /// Stable migration failure code when blocked.
+    pub migration_error_code: Option<String>,
+    /// Snapshot creation time (from manifest).
+    pub created_at: DateTime,
+    /// When this row was inserted/refreshed.
+    pub indexed_at: DateTime,
+    /// Number of distinct child identities whose parent is this snapshot's stable identity.
+    pub child_count: i32,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Types: Relations
+//--------------------------------------------------------------------------------------------------
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl ActiveModelBehavior for ActiveModel {}

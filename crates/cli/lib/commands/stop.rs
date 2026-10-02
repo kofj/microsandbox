@@ -1,0 +1,134 @@
+//! `msb stop` command — stop a running sandbox.
+
+use clap::Args;
+use microsandbox::sandbox::Sandbox;
+
+use crate::ui;
+
+use super::common;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Stop one or more running sandboxes.
+#[derive(Debug, Args)]
+pub struct StopArgs {
+    /// Sandbox(es) to stop. Required unless `--label` is given.
+    #[arg(required_unless_present = "label")]
+    pub names: Vec<String>,
+
+    /// Stop every sandbox carrying this label (`KEY=VALUE`). Repeatable;
+    /// AND-matched. Unioned with any explicitly named sandboxes.
+    #[arg(long)]
+    pub label: Vec<String>,
+
+    /// Immediately kill the sandbox without graceful shutdown.
+    /// Pending writes that the workload hasn't `fsync`'d may be lost.
+    #[arg(short, long)]
+    pub force: bool,
+
+    /// Graceful completion budget in seconds; timeout fails without killing. Omit to wait indefinitely.
+    #[arg(short = 't', long)]
+    pub timeout: Option<u64>,
+
+    /// Suppress progress output.
+    #[arg(short, long)]
+    pub quiet: bool,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Execute the `msb stop` command.
+pub async fn run(args: StopArgs) -> anyhow::Result<()> {
+    let names = common::resolve_bulk_targets(&args.names, &args.label, args.quiet).await?;
+    let mut failed = false;
+
+    for name in &names {
+        let spinner = if args.quiet {
+            ui::Spinner::quiet()
+        } else {
+            ui::Spinner::start("Stopping", name)
+        };
+
+        match stop_one(name, args.force, args.timeout).await {
+            Ok(()) => {
+                spinner.finish_success("Stopped");
+            }
+            Err(e) => {
+                spinner.finish_clear();
+                ui::error(&format!("{e}"));
+                failed = true;
+            }
+        }
+    }
+
+    if failed {
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// Stop a single sandbox.
+async fn stop_one(name: &str, force: bool, timeout_secs: Option<u64>) -> anyhow::Result<()> {
+    let handle = Sandbox::get(name).await?;
+    let result = if force {
+        handle.kill().await
+    } else if let Some(timeout_secs) = timeout_secs {
+        handle
+            .stop_with_timeout(std::time::Duration::from_secs(timeout_secs))
+            .await
+    } else {
+        handle.stop().await
+    };
+
+    result.map_err(Into::into)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: StopArgs,
+    }
+
+    fn parse_stop_args(args: &[&str]) -> StopArgs {
+        TestCli::parse_from(std::iter::once("msb").chain(args.iter().copied())).args
+    }
+
+    #[test]
+    fn parses_one_name() {
+        let args = parse_stop_args(&["reborn"]);
+
+        assert_eq!(args.names, vec!["reborn"]);
+    }
+
+    #[test]
+    fn parses_multiple_names() {
+        let args = parse_stop_args(&["msb-28b6f33e", "reborn", "renamed"]);
+
+        assert_eq!(args.names, vec!["msb-28b6f33e", "reborn", "renamed"]);
+    }
+
+    #[test]
+    fn default_is_unbounded_and_zero_does_not_select_force() {
+        let ordinary = parse_stop_args(&["reborn"]);
+        assert_eq!(ordinary.timeout, None);
+        assert!(!ordinary.force);
+        let zero = parse_stop_args(&["-t", "0", "reborn"]);
+        assert_eq!(zero.timeout, Some(0));
+        assert!(!zero.force);
+    }
+}

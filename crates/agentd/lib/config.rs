@@ -1,0 +1,2374 @@
+//! Agentd configuration, received once over the guest console at startup.
+//!
+//! Split into two structs with different lifetimes:
+//!
+//! - [`BootParams`] - one-shot bootstrap values consumed by [`init::init`] and
+//!   dropped once init completes.
+//! - [`AgentdConfig`] — runtime config that outlives init (currently just
+//!   the default guest user), passed by reference to the agent loop.
+//!
+//! The typed bootstrap is validated before full guest initialization. Legacy
+//! environment parsers remain local to this module for compatibility tests.
+//!
+//! [`init::init`]: crate::init::init
+
+use std::env;
+use std::ffi::OsString;
+use std::net::{Ipv4Addr, Ipv6Addr};
+use std::path::PathBuf;
+
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use microsandbox_protocol::{
+    ENV_BLOCK_ROOT, ENV_DIR_MOUNTS, ENV_DISK_MOUNTS, ENV_FILE_MOUNTS, ENV_HANDOFF_INIT,
+    ENV_HANDOFF_INIT_ARGS, ENV_HANDOFF_INIT_CWD, ENV_HANDOFF_INIT_ENV, ENV_HOST_ALIAS,
+    ENV_HOSTNAME, ENV_NET, ENV_NET_IPV4, ENV_NET_IPV6, ENV_RLIMITS, ENV_SECURITY_PROFILE,
+    ENV_TMPFS, ENV_USER, HANDOFF_INIT_AUTO,
+    bootstrap::{
+        BootstrapBlockRoot, BootstrapBlockRootUpper, BootstrapEnvVar, BootstrapHandoffInit,
+        BootstrapSecurityProfile, GuestBootstrap,
+    },
+    exec::ExecRlimit,
+};
+use serde::de::DeserializeOwned;
+
+use crate::error::{AgentdError, AgentdResult};
+use crate::rlimit;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// One-shot bootstrap values consumed by [`init::init`] and dropped afterward.
+///
+/// Moved by value into init; owning the data (rather than borrowing) makes
+/// the "consumed once" lifetime explicit in the signature and prevents
+/// accidental reads after init completes.
+///
+/// [`init::init`]: crate::init::init
+#[derive(Debug)]
+pub struct BootParams {
+    /// Block device configuration for a rootfs switch.
+    pub(crate) block_root: Option<BlockRootSpec>,
+
+    /// Virtiofs directory mount specs (empty when unset).
+    pub(crate) dir_mounts: Vec<DirMountSpec>,
+
+    /// Virtiofs file mount specs (empty when unset).
+    pub(crate) file_mounts: Vec<FileMountSpec>,
+
+    /// Disk-image mount specs (empty when unset).
+    pub(crate) disk_mounts: Vec<DiskMountSpec>,
+
+    /// Tmpfs mount specs (empty when unset).
+    pub(crate) tmpfs: Vec<TmpfsSpec>,
+
+    /// In-guest security profile.
+    pub(crate) security_profile: SecurityProfile,
+
+    /// Guest hostname.
+    pub(crate) hostname: Option<String>,
+
+    /// DNS name (for example `host.microsandbox.internal`) the guest uses to
+    /// reach the sandbox host. Written into `/etc/hosts` at the gateway IPs.
+    pub(crate) host_alias: Option<String>,
+
+    /// Network interface configuration.
+    pub(crate) net: Option<NetSpec>,
+
+    /// IPv4 configuration.
+    pub(crate) net_ipv4: Option<NetIpv4Spec>,
+
+    /// IPv6 configuration.
+    pub(crate) net_ipv6: Option<NetIpv6Spec>,
+
+    /// Sandbox-wide resource limits applied to PID 1 so every guest process
+    /// inherits the raised baseline (empty when unset).
+    pub(crate) rlimits: Vec<ExecRlimit>,
+
+    /// Guest init binary to which agentd hands off PID 1 after `init::init()`.
+    /// `None` means agentd remains PID 1 (the default).
+    pub(crate) handoff_init: Option<HandoffInit>,
+}
+
+/// Parsed handoff-init specification.
+///
+/// When present in [`BootParams`], agentd performs setup, forks, the
+/// parent execs `cmd` (becoming the new PID 1), and the child
+/// continues as the agent loop.
+#[derive(Debug)]
+pub struct HandoffInit {
+    /// Absolute path inside the guest rootfs, or the literal `"auto"`
+    /// (resolved via [`HANDOFF_INIT_AUTO_CANDIDATES`] in `do_handoff`).
+    pub(crate) cmd: PathBuf,
+
+    /// argv past `argv[0]` — i.e., the supplemental arguments. Empty
+    /// means the init is exec'd with `argv = [cmd]`.
+    pub(crate) argv: Vec<OsString>,
+
+    /// Working directory to enter before execing the init binary.
+    pub(crate) cwd: Option<PathBuf>,
+
+    /// Extra env vars merged on top of the inherited env. Empty means
+    /// inherit-only.
+    pub(crate) env: Vec<(OsString, OsString)>,
+}
+
+/// Runtime configuration surviving past init; referenced by the agent loop.
+///
+/// Holds runtime settings used after init, including the default guest user
+/// and security profile for exec sessions.
+#[derive(Debug)]
+pub struct AgentdConfig {
+    /// Default guest user for exec sessions, captured at startup.
+    pub(crate) user: Option<String>,
+
+    /// In-guest security profile for exec sessions.
+    pub(crate) security_profile: SecurityProfile,
+
+    /// Default working directory for requests that omit one.
+    pub(crate) default_cwd: Option<String>,
+
+    /// Baseline image/user environment plus host-generated placeholders.
+    pub(crate) default_env: Vec<BootstrapEnvVar>,
+}
+
+/// In-guest security profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SecurityProfile {
+    /// Preserve normal guest-root behavior.
+    #[default]
+    Default,
+
+    /// Set `no_new_privs`, drop `CAP_SYS_ADMIN`, and force `nosuid,nodev` mounts.
+    Restricted,
+}
+
+/// Parsed tmpfs mount specification.
+#[derive(Debug)]
+pub(crate) struct TmpfsSpec {
+    pub path: String,
+    pub size_mib: Option<u32>,
+    pub mode: Option<u32>,
+    pub noexec: bool,
+    pub nosuid: bool,
+    pub nodev: bool,
+    pub readonly: bool,
+}
+
+/// Parsed block-device root specification with kind-based dispatch.
+#[derive(Debug)]
+pub(crate) enum BlockRootSpec {
+    /// Single disk image.
+    DiskImage {
+        device: String,
+        fstype: Option<String>,
+    },
+    /// OCI EROFS: merged EROFS lower + writable upper + guest overlayfs.
+    OciErofs {
+        lower: String,
+        upper: BlockRootUpper,
+    },
+}
+
+/// Writable upper backing for the OCI EROFS root.
+///
+/// `upper=<device>` carries a filesystem on a virtio-blk device (managed
+/// ext4 or a user disk image); `upper=tmpfs` means no upper device is
+/// attached and agentd assembles a RAM-backed upper itself.
+#[derive(Debug)]
+pub(crate) enum BlockRootUpper {
+    /// Writable filesystem on a block device (`upper_fstype` required).
+    Device { device: String, fstype: String },
+    /// RAM-backed tmpfs sized by `upper_size_mib` (kernel default when absent).
+    Tmpfs { size_mib: Option<u32> },
+}
+
+/// Parsed virtiofs directory volume mount specification.
+#[derive(Debug)]
+pub(crate) struct DirMountSpec {
+    pub tag: String,
+    pub guest_path: String,
+    pub readonly: bool,
+    pub noexec: bool,
+    pub nosuid: bool,
+    pub nodev: bool,
+}
+
+/// Parsed virtiofs file volume mount specification.
+#[derive(Debug)]
+pub(crate) struct FileMountSpec {
+    pub tag: String,
+    pub filename: String,
+    pub guest_path: String,
+    pub readonly: bool,
+    pub noexec: bool,
+    pub nosuid: bool,
+    pub nodev: bool,
+}
+
+/// Parsed disk-image volume mount specification.
+///
+/// Each entry corresponds to one extra virtio-blk device attached by the
+/// VMM. Agentd resolves the device node from `id` via
+/// `/dev/disk/by-id/virtio-<id>` and mounts it at `guest_path`.
+#[derive(Debug)]
+pub(crate) struct DiskMountSpec {
+    pub id: String,
+    pub guest_path: String,
+    /// Inner filesystem type. `None` triggers an autodetect walk over
+    /// `/proc/filesystems` in agentd's init path.
+    pub fstype: Option<String>,
+    pub readonly: bool,
+    pub noexec: bool,
+    pub nosuid: bool,
+    pub nodev: bool,
+}
+
+/// Parsed common volume mount option block.
+#[derive(Debug, Default)]
+struct ParsedMountOptions {
+    readonly: bool,
+    noexec: bool,
+    nosuid: bool,
+    nodev: bool,
+    fstype: Option<String>,
+    size_mib: Option<u32>,
+    mode: Option<u32>,
+}
+
+/// Which keyed options are valid for a specific mount environment variable.
+#[derive(Debug, Clone, Copy, Default)]
+struct MountOptionSupport {
+    fstype: bool,
+    size: bool,
+    mode: bool,
+}
+
+/// Parsed `MSB_NET` specification.
+#[derive(Debug)]
+pub(crate) struct NetSpec {
+    pub iface: String,
+    pub mac: [u8; 6],
+    pub mtu: u16,
+}
+
+/// Parsed `MSB_NET_IPV4` specification.
+#[derive(Debug)]
+pub(crate) struct NetIpv4Spec {
+    pub address: Ipv4Addr,
+    pub prefix_len: u8,
+    pub gateway: Ipv4Addr,
+    pub dns: Option<Ipv4Addr>,
+}
+
+/// Parsed `MSB_NET_IPV6` specification.
+#[derive(Debug)]
+pub(crate) struct NetIpv6Spec {
+    pub address: Ipv6Addr,
+    pub prefix_len: u8,
+    pub gateway: Ipv6Addr,
+    pub dns: Option<Ipv6Addr>,
+}
+
+/// Bundled network configuration: interface + IPv4 + IPv6.
+///
+/// Borrows the three `MSB_NET*` specs so they can travel as one parameter.
+#[derive(Debug)]
+pub(crate) struct NetConfig<'a> {
+    pub net: Option<&'a NetSpec>,
+    pub ipv4: Option<&'a NetIpv4Spec>,
+    pub ipv6: Option<&'a NetIpv6Spec>,
+}
+
+//--------------------------------------------------------------------------------------------------
+// Implementations
+//--------------------------------------------------------------------------------------------------
+
+impl BootParams {
+    /// Validate and convert the typed console bootstrap into agentd's init and
+    /// long-lived runtime configuration.
+    pub fn from_bootstrap(bootstrap: GuestBootstrap) -> AgentdResult<(Self, AgentdConfig)> {
+        validate_guest_bootstrap(&bootstrap)?;
+
+        let GuestBootstrap {
+            block_root,
+            dir_mounts,
+            file_mounts,
+            disk_mounts,
+            tmpfs_mounts,
+            hostname,
+            host_alias,
+            network,
+            rlimits,
+            user,
+            default_cwd,
+            default_env,
+            security_profile,
+            handoff_init,
+        } = bootstrap;
+
+        let security_profile = match security_profile {
+            BootstrapSecurityProfile::Default => SecurityProfile::Default,
+            BootstrapSecurityProfile::Restricted => SecurityProfile::Restricted,
+        };
+        let block_root = block_root.map(|root| match root {
+            BootstrapBlockRoot::DiskImage { device, fstype } => {
+                BlockRootSpec::DiskImage { device, fstype }
+            }
+            BootstrapBlockRoot::OciErofs { lower, upper } => BlockRootSpec::OciErofs {
+                lower,
+                upper: match upper {
+                    BootstrapBlockRootUpper::Device { device, fstype } => {
+                        BlockRootUpper::Device { device, fstype }
+                    }
+                    BootstrapBlockRootUpper::Tmpfs { size_mib } => {
+                        BlockRootUpper::Tmpfs { size_mib }
+                    }
+                },
+            },
+        });
+        let dir_mounts = dir_mounts
+            .into_iter()
+            .map(|mount| {
+                let flags = mount.flags;
+                DirMountSpec {
+                    tag: mount.tag,
+                    guest_path: mount.guest_path,
+                    readonly: flags.readonly,
+                    noexec: flags.noexec,
+                    nosuid: flags.nosuid,
+                    nodev: flags.nodev,
+                }
+            })
+            .collect();
+        let file_mounts = file_mounts
+            .into_iter()
+            .map(|mount| {
+                let flags = mount.flags;
+                FileMountSpec {
+                    tag: mount.tag,
+                    filename: mount.filename,
+                    guest_path: mount.guest_path,
+                    readonly: flags.readonly,
+                    noexec: flags.noexec,
+                    nosuid: flags.nosuid,
+                    nodev: flags.nodev,
+                }
+            })
+            .collect();
+        let disk_mounts = disk_mounts
+            .into_iter()
+            .map(|mount| {
+                let flags = mount.flags;
+                DiskMountSpec {
+                    id: mount.id,
+                    guest_path: mount.guest_path,
+                    fstype: mount.fstype,
+                    readonly: flags.readonly,
+                    noexec: flags.noexec,
+                    nosuid: flags.nosuid,
+                    nodev: flags.nodev,
+                }
+            })
+            .collect();
+        let tmpfs = tmpfs_mounts
+            .into_iter()
+            .map(|mount| {
+                let flags = mount.flags;
+                TmpfsSpec {
+                    path: mount.path,
+                    size_mib: mount.size_mib,
+                    mode: mount.mode,
+                    noexec: flags.noexec,
+                    nosuid: flags.nosuid,
+                    nodev: flags.nodev,
+                    readonly: flags.readonly,
+                }
+            })
+            .collect();
+        let (net, net_ipv4, net_ipv6) = match network {
+            Some(network) => {
+                let net = NetSpec {
+                    iface: network.interface,
+                    mac: network.mac,
+                    mtu: network.mtu,
+                };
+                let ipv4 = network.ipv4.map(|ipv4| NetIpv4Spec {
+                    address: ipv4.address,
+                    prefix_len: ipv4.prefix_len,
+                    gateway: ipv4.gateway,
+                    dns: ipv4.dns,
+                });
+                let ipv6 = network.ipv6.map(|ipv6| NetIpv6Spec {
+                    address: ipv6.address,
+                    prefix_len: ipv6.prefix_len,
+                    gateway: ipv6.gateway,
+                    dns: ipv6.dns,
+                });
+                (Some(net), ipv4, ipv6)
+            }
+            None => (None, None, None),
+        };
+        let handoff_init = handoff_init.map(convert_bootstrap_handoff).transpose()?;
+
+        Ok((
+            Self {
+                block_root,
+                dir_mounts,
+                file_mounts,
+                disk_mounts,
+                tmpfs,
+                security_profile,
+                hostname,
+                host_alias,
+                net,
+                net_ipv4,
+                net_ipv6,
+                rlimits,
+                handoff_init,
+            },
+            AgentdConfig {
+                user,
+                security_profile,
+                default_cwd,
+                default_env,
+            },
+        ))
+    }
+
+    /// Reads and parses the boot-time `MSB_*` environment variables.
+    ///
+    /// Empty or whitespace-only values are treated as absent (`None`).
+    /// Returns an error if any present value fails to parse.
+    pub fn from_env() -> AgentdResult<Self> {
+        Ok(Self {
+            block_root: read_env(ENV_BLOCK_ROOT)
+                .map(|v| parse_block_root(&v))
+                .transpose()?,
+            dir_mounts: read_env(ENV_DIR_MOUNTS)
+                .map(|v| parse_dir_mounts(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            file_mounts: read_env(ENV_FILE_MOUNTS)
+                .map(|v| parse_file_mounts(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            disk_mounts: read_env(ENV_DISK_MOUNTS)
+                .map(|v| parse_disk_mounts(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            tmpfs: read_env(ENV_TMPFS)
+                .map(|v| parse_tmpfs_mounts(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            hostname: read_env(ENV_HOSTNAME),
+            host_alias: read_env(ENV_HOST_ALIAS),
+            net: read_env(ENV_NET).map(|v| parse_net(&v)).transpose()?,
+            net_ipv4: read_env(ENV_NET_IPV4)
+                .map(|v| parse_net_ipv4(&v))
+                .transpose()?,
+            net_ipv6: read_env(ENV_NET_IPV6)
+                .map(|v| parse_net_ipv6(&v))
+                .transpose()?,
+            rlimits: read_env(ENV_RLIMITS)
+                .map(|v| parse_rlimits(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            security_profile: read_env(ENV_SECURITY_PROFILE)
+                .map(|v| parse_security_profile(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            handoff_init: parse_handoff_init()?,
+        })
+    }
+
+    /// Take the handoff-init spec out of the boot params.
+    ///
+    /// Used by `bin/main.rs` before `init::init` consumes `BootParams`
+    /// by value, since the handoff hook fires after init returns.
+    pub fn take_handoff_init(&mut self) -> Option<HandoffInit> {
+        self.handoff_init.take()
+    }
+
+    /// Borrows the three `MSB_NET*` specs as a single bundle.
+    pub(crate) fn network(&self) -> NetConfig<'_> {
+        NetConfig {
+            net: self.net.as_ref(),
+            ipv4: self.net_ipv4.as_ref(),
+            ipv6: self.net_ipv6.as_ref(),
+        }
+    }
+}
+
+impl AgentdConfig {
+    /// Returns the configured default guest user, if any.
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
+    /// Return the sandbox working directory used when an exec request omits one.
+    pub fn default_cwd(&self) -> Option<&str> {
+        self.default_cwd.as_deref()
+    }
+
+    /// Install the baseline workload environment before any guest child is created.
+    pub fn install_default_env(&self) {
+        for variable in &self.default_env {
+            // SAFETY: agentd is still single-threaded during bootstrap, and
+            // `validate_guest_bootstrap` rejected NUL bytes in both fields.
+            unsafe { env::set_var(&variable.key, &variable.value) };
+        }
+
+        // The former libkrun environment transport always installed this
+        // prefix for both agent execs and PID 1 handoff. Preserve that
+        // inheritance without relying on agentd's ambient boot environment.
+        let configured_path = self
+            .default_env
+            .iter()
+            .rev()
+            .find(|variable| variable.key == "PATH")
+            .map(|variable| variable.value.as_str());
+        // SAFETY: `scripts_path` constructs a NUL-free key and value while
+        // agentd is still single-threaded during bootstrap.
+        unsafe { env::set_var("PATH", scripts_path(configured_path)) };
+    }
+
+    /// Reads the runtime-config `MSB_*` environment variables.
+    ///
+    /// Empty or whitespace-only values are treated as absent (`None`).
+    pub fn from_env() -> AgentdResult<Self> {
+        Ok(Self {
+            user: read_env(ENV_USER),
+            security_profile: read_env(ENV_SECURITY_PROFILE)
+                .map(|v| parse_security_profile(&v))
+                .transpose()?
+                .unwrap_or_default(),
+            default_cwd: None,
+            default_env: Vec::new(),
+        })
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Runtime Environment
+//--------------------------------------------------------------------------------------------------
+
+/// Return a guest PATH with the runtime scripts directory present exactly once.
+pub(crate) fn scripts_path(existing: Option<&str>) -> String {
+    const DEFAULT_GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    let existing = existing.unwrap_or(DEFAULT_GUEST_PATH);
+    if existing
+        .split(':')
+        .any(|segment| segment == microsandbox_protocol::SCRIPTS_PATH)
+    {
+        existing.to_string()
+    } else {
+        format!("{}:{existing}", microsandbox_protocol::SCRIPTS_PATH)
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Parse Functions: Block Root / Volume Mounts / Tmpfs
+//--------------------------------------------------------------------------------------------------
+
+fn parse_security_profile(value: &str) -> AgentdResult<SecurityProfile> {
+    match value {
+        "default" => Ok(SecurityProfile::Default),
+        "restricted" => Ok(SecurityProfile::Restricted),
+        other => Err(AgentdError::Config(format!(
+            "{ENV_SECURITY_PROFILE} unknown value: {other}"
+        ))),
+    }
+}
+
+/// Parses `MSB_BLOCK_ROOT` into a kind-based spec.
+///
+/// Supports:
+/// - `kind=disk-image,device=/dev/vda[,fstype=ext4]`
+/// - `kind=oci-erofs,lower=/dev/vdb,upper=/dev/vdc,upper_fstype=ext4`
+fn parse_block_root(val: &str) -> AgentdResult<BlockRootSpec> {
+    let mut kv: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+    for part in val.split(',') {
+        let Some((k, v)) = part.split_once('=') else {
+            continue;
+        };
+        if kv.insert(k, v).is_some() {
+            return Err(AgentdError::Config(format!(
+                "MSB_BLOCK_ROOT duplicate key '{k}'"
+            )));
+        }
+    }
+
+    let get = |key: &str| -> AgentdResult<String> {
+        kv.get(key)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .ok_or_else(|| AgentdError::Config(format!("MSB_BLOCK_ROOT missing '{key}'")))
+    };
+
+    match kv.get("kind").copied() {
+        Some("disk-image") => {
+            let device = get("device")?;
+            let fstype = kv
+                .get("fstype")
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string());
+            Ok(BlockRootSpec::DiskImage { device, fstype })
+        }
+        Some("oci-erofs") => {
+            let lower = get("lower")?;
+            let upper = if kv.get("upper").copied() == Some("tmpfs") {
+                let size_mib = kv
+                    .get("upper_size_mib")
+                    .map(|v| {
+                        v.parse::<u32>().map_err(|e| {
+                            AgentdError::Config(format!(
+                                "MSB_BLOCK_ROOT invalid upper_size_mib '{v}': {e}"
+                            ))
+                        })
+                    })
+                    .transpose()?;
+                if kv.contains_key("upper_fstype") {
+                    return Err(AgentdError::Config(
+                        "MSB_BLOCK_ROOT upper_fstype is not valid with upper=tmpfs".into(),
+                    ));
+                }
+                BlockRootUpper::Tmpfs { size_mib }
+            } else {
+                BlockRootUpper::Device {
+                    device: get("upper")?,
+                    fstype: get("upper_fstype")?,
+                }
+            };
+            Ok(BlockRootSpec::OciErofs { lower, upper })
+        }
+        Some(other) => Err(AgentdError::Config(format!(
+            "MSB_BLOCK_ROOT unknown kind: {other}"
+        ))),
+        None => Err(AgentdError::Config(
+            "MSB_BLOCK_ROOT missing 'kind' key".into(),
+        )),
+    }
+}
+
+/// Parse a comma-separated volume mount option block.
+fn parse_mount_options(
+    env_name: &str,
+    opts: Option<&str>,
+    support: MountOptionSupport,
+) -> AgentdResult<ParsedMountOptions> {
+    let mut parsed = ParsedMountOptions::default();
+    let mut seen_access = false;
+    let mut seen_noexec = false;
+    let mut seen_nosuid = false;
+    let mut seen_nodev = false;
+    let mut seen_fstype = false;
+    let mut seen_size = false;
+    let mut seen_mode = false;
+
+    let Some(opts) = opts else {
+        return Ok(parsed);
+    };
+
+    for opt in opts.split(',') {
+        let opt = opt.trim();
+        if opt.is_empty() {
+            continue;
+        }
+        match opt {
+            "ro" | "rw" => {
+                if seen_access {
+                    return Err(AgentdError::Config(format!(
+                        "{env_name} option 'ro'/'rw' specified more than once"
+                    )));
+                }
+                seen_access = true;
+                parsed.readonly = opt == "ro";
+            }
+            "noexec" => {
+                if seen_noexec {
+                    return Err(AgentdError::Config(format!(
+                        "{env_name} option 'noexec' specified more than once"
+                    )));
+                }
+                seen_noexec = true;
+                parsed.noexec = true;
+            }
+            "nosuid" => {
+                if seen_nosuid {
+                    return Err(AgentdError::Config(format!(
+                        "{env_name} option 'nosuid' specified more than once"
+                    )));
+                }
+                seen_nosuid = true;
+                parsed.nosuid = true;
+            }
+            "nodev" => {
+                if seen_nodev {
+                    return Err(AgentdError::Config(format!(
+                        "{env_name} option 'nodev' specified more than once"
+                    )));
+                }
+                seen_nodev = true;
+                parsed.nodev = true;
+            }
+            "suid" | "exec" | "dev" => {
+                return Err(AgentdError::Config(format!(
+                    "{env_name} unsupported mount option '{opt}'"
+                )));
+            }
+            _ => {
+                let (key, value) = opt.split_once('=').ok_or_else(|| {
+                    AgentdError::Config(format!("{env_name} unknown mount option '{opt}'"))
+                })?;
+                if value.is_empty() {
+                    return Err(AgentdError::Config(format!(
+                        "{env_name} option '{key}' must not be empty"
+                    )));
+                }
+                match key {
+                    "fstype" if support.fstype => {
+                        if seen_fstype {
+                            return Err(AgentdError::Config(format!(
+                                "{env_name} option 'fstype' specified more than once"
+                            )));
+                        }
+                        seen_fstype = true;
+                        if value.chars().any(|c| matches!(c, ',' | ';' | ':' | '=')) {
+                            return Err(AgentdError::Config(format!(
+                                "{env_name} fstype must not contain ',', ';', ':', or '=': {value}"
+                            )));
+                        }
+                        parsed.fstype = Some(value.to_string());
+                    }
+                    "size" if support.size => {
+                        if seen_size {
+                            return Err(AgentdError::Config(format!(
+                                "{env_name} option 'size' specified more than once"
+                            )));
+                        }
+                        seen_size = true;
+                        parsed.size_mib = Some(value.parse::<u32>().map_err(|_| {
+                            AgentdError::Config(format!("{env_name} invalid tmpfs size: {value}"))
+                        })?);
+                    }
+                    "mode" if support.mode => {
+                        if seen_mode {
+                            return Err(AgentdError::Config(format!(
+                                "{env_name} option 'mode' specified more than once"
+                            )));
+                        }
+                        seen_mode = true;
+                        parsed.mode = Some(u32::from_str_radix(value, 8).map_err(|_| {
+                            AgentdError::Config(format!(
+                                "{env_name} invalid octal tmpfs mode: {value}"
+                            ))
+                        })?);
+                    }
+                    "fstype" | "size" | "mode" => {
+                        return Err(AgentdError::Config(format!(
+                            "{env_name} option '{key}' is not valid for this mount kind"
+                        )));
+                    }
+                    other => {
+                        return Err(AgentdError::Config(format!(
+                            "{env_name} unknown mount option '{other}'"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+/// Parses semicolon-separated directory mount entries.
+fn parse_dir_mounts(val: &str) -> AgentdResult<Vec<DirMountSpec>> {
+    val.split(';')
+        .filter(|e| !e.is_empty())
+        .map(parse_dir_mount_entry)
+        .collect()
+}
+
+/// Parses a single virtiofs directory volume mount entry: `tag:guest_path[:opts]`.
+fn parse_dir_mount_entry(entry: &str) -> AgentdResult<DirMountSpec> {
+    let mut parts = entry.splitn(3, ':');
+    let Some(tag) = parts.next() else {
+        unreachable!("splitn always yields at least one part");
+    };
+    let guest_path = parts.next().ok_or_else(|| {
+        AgentdError::Config(format!(
+            "MSB_DIR_MOUNTS entry must be tag:path[:opts], got: {entry}"
+        ))
+    })?;
+    let options = parse_mount_options(ENV_DIR_MOUNTS, parts.next(), MountOptionSupport::default())?;
+
+    if tag.is_empty() {
+        return Err(AgentdError::Config(
+            "MSB_DIR_MOUNTS entry has empty tag".into(),
+        ));
+    }
+    if guest_path.is_empty() || !guest_path.starts_with('/') {
+        return Err(AgentdError::Config(format!(
+            "MSB_DIR_MOUNTS guest path must be absolute: {guest_path}"
+        )));
+    }
+
+    Ok(DirMountSpec {
+        tag: tag.to_string(),
+        guest_path: guest_path.to_string(),
+        readonly: options.readonly,
+        noexec: options.noexec,
+        nosuid: options.nosuid,
+        nodev: options.nodev,
+    })
+}
+
+/// Parses semicolon-separated file mount entries.
+fn parse_file_mounts(val: &str) -> AgentdResult<Vec<FileMountSpec>> {
+    val.split(';')
+        .filter(|e| !e.is_empty())
+        .map(parse_file_mount_entry)
+        .collect()
+}
+
+/// Parses a single virtiofs file volume mount entry: `tag:filename:guest_path[:opts]`.
+fn parse_file_mount_entry(entry: &str) -> AgentdResult<FileMountSpec> {
+    let mut parts = entry.splitn(4, ':');
+    let Some(tag) = parts.next() else {
+        unreachable!("splitn always yields at least one part");
+    };
+    let filename = parts.next().ok_or_else(|| {
+        AgentdError::Config(format!(
+            "MSB_FILE_MOUNTS entry must be tag:filename:path[:opts], got: {entry}"
+        ))
+    })?;
+    let guest_path = parts.next().ok_or_else(|| {
+        AgentdError::Config(format!(
+            "MSB_FILE_MOUNTS entry must be tag:filename:path[:opts], got: {entry}"
+        ))
+    })?;
+    let options =
+        parse_mount_options(ENV_FILE_MOUNTS, parts.next(), MountOptionSupport::default())?;
+
+    if tag.is_empty() {
+        return Err(AgentdError::Config(
+            "MSB_FILE_MOUNTS entry has empty tag".into(),
+        ));
+    }
+    if filename.is_empty() {
+        return Err(AgentdError::Config(
+            "MSB_FILE_MOUNTS entry has empty filename".into(),
+        ));
+    }
+    if guest_path.is_empty() || !guest_path.starts_with('/') {
+        return Err(AgentdError::Config(format!(
+            "MSB_FILE_MOUNTS guest path must be absolute: {guest_path}"
+        )));
+    }
+
+    Ok(FileMountSpec {
+        tag: tag.to_string(),
+        filename: filename.to_string(),
+        guest_path: guest_path.to_string(),
+        readonly: options.readonly,
+        noexec: options.noexec,
+        nosuid: options.nosuid,
+        nodev: options.nodev,
+    })
+}
+
+/// Parses semicolon-separated disk-image mount entries.
+fn parse_disk_mounts(val: &str) -> AgentdResult<Vec<DiskMountSpec>> {
+    val.split(';')
+        .filter(|e| !e.is_empty())
+        .map(parse_disk_mount_entry)
+        .collect()
+}
+
+/// Parses a single disk-image mount entry: `id:guest_path[:opts]`.
+fn parse_disk_mount_entry(entry: &str) -> AgentdResult<DiskMountSpec> {
+    let mut parts = entry.splitn(3, ':');
+    let Some(id) = parts.next() else {
+        unreachable!("splitn always yields at least one part");
+    };
+    let guest_path = parts.next().ok_or_else(|| {
+        AgentdError::Config(format!(
+            "MSB_DISK_MOUNTS entry must be id:guest_path[:opts], got: {entry}"
+        ))
+    })?;
+    let options = parse_mount_options(
+        ENV_DISK_MOUNTS,
+        parts.next(),
+        MountOptionSupport {
+            fstype: true,
+            ..MountOptionSupport::default()
+        },
+    )?;
+
+    if id.is_empty() {
+        return Err(AgentdError::Config(
+            "MSB_DISK_MOUNTS entry has empty id".into(),
+        ));
+    }
+    if guest_path.is_empty() || !guest_path.starts_with('/') {
+        return Err(AgentdError::Config(format!(
+            "MSB_DISK_MOUNTS guest path must be absolute: {guest_path}"
+        )));
+    }
+
+    Ok(DiskMountSpec {
+        id: id.to_string(),
+        guest_path: guest_path.to_string(),
+        fstype: options.fstype,
+        readonly: options.readonly,
+        noexec: options.noexec,
+        nosuid: options.nosuid,
+        nodev: options.nodev,
+    })
+}
+
+/// Parses semicolon-separated tmpfs mount entries.
+fn parse_tmpfs_mounts(val: &str) -> AgentdResult<Vec<TmpfsSpec>> {
+    val.split(';')
+        .filter(|e| !e.is_empty())
+        .map(parse_tmpfs_entry)
+        .collect()
+}
+
+/// Parses a single tmpfs entry: `path[:opts]`.
+///
+/// Supported options are `size=N`, `mode=N`, `ro`, `rw`, `nosuid`, `nodev`, and `noexec`.
+/// Mode is parsed as octal (e.g. `mode=1777`).
+fn parse_tmpfs_entry(entry: &str) -> AgentdResult<TmpfsSpec> {
+    let (path, opts) = match entry.split_once(':') {
+        Some((path, opts)) => (path, Some(opts)),
+        None => {
+            if entry.contains(',') {
+                return Err(AgentdError::Config(
+                    "MSB_TMPFS options must use path:opts syntax".into(),
+                ));
+            }
+            (entry, None)
+        }
+    };
+
+    if path.is_empty() {
+        return Err(AgentdError::Config("tmpfs entry has empty path".into()));
+    }
+
+    let options = parse_mount_options(
+        ENV_TMPFS,
+        opts,
+        MountOptionSupport {
+            size: true,
+            mode: true,
+            ..MountOptionSupport::default()
+        },
+    )?;
+
+    Ok(TmpfsSpec {
+        path: path.to_string(),
+        size_mib: options.size_mib,
+        mode: options.mode,
+        noexec: options.noexec,
+        nosuid: options.nosuid,
+        nodev: options.nodev,
+        readonly: options.readonly,
+    })
+}
+
+//--------------------------------------------------------------------------------------------------
+// Parse Functions: Rlimits
+//--------------------------------------------------------------------------------------------------
+
+/// Parses `MSB_RLIMITS` value: semicolon-separated `resource=soft[:hard]` entries.
+///
+/// Rejects unknown resource names and duplicate resources at startup so
+/// misspellings and overrides fail loud rather than silently last-winning
+/// during PID 1 init.
+fn parse_rlimits(val: &str) -> AgentdResult<Vec<ExecRlimit>> {
+    let mut seen: Vec<String> = Vec::new();
+    val.split(';')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let rlimit = entry.parse::<ExecRlimit>().map_err(|err| {
+                AgentdError::Config(format!("{ENV_RLIMITS} entry {entry}: {err}"))
+            })?;
+            if rlimit::parse_rlimit_resource(&rlimit.resource).is_none() {
+                return Err(AgentdError::Config(format!(
+                    "{ENV_RLIMITS} unknown resource: {}",
+                    rlimit.resource
+                )));
+            }
+            if seen.iter().any(|name| name == &rlimit.resource) {
+                return Err(AgentdError::Config(format!(
+                    "{ENV_RLIMITS} duplicate resource: {}",
+                    rlimit.resource
+                )));
+            }
+            seen.push(rlimit.resource.clone());
+            Ok(rlimit)
+        })
+        .collect()
+}
+
+//--------------------------------------------------------------------------------------------------
+// Parse Functions: Network
+//--------------------------------------------------------------------------------------------------
+
+/// Parses `MSB_NET` value: `iface=NAME,mac=AA:BB:CC:DD:EE:FF,mtu=N`
+fn parse_net(val: &str) -> AgentdResult<NetSpec> {
+    let mut iface = None;
+    let mut mac = None;
+    let mut mtu = 1500u16;
+
+    for part in val.split(',') {
+        if let Some(v) = part.strip_prefix("iface=") {
+            iface = Some(v.to_string());
+        } else if let Some(v) = part.strip_prefix("mac=") {
+            mac = Some(parse_mac(v)?);
+        } else if let Some(v) = part.strip_prefix("mtu=") {
+            mtu = v
+                .parse()
+                .map_err(|_| AgentdError::Config(format!("invalid MTU: {v}")))?;
+        } else {
+            return Err(AgentdError::Config(format!(
+                "unknown MSB_NET option: {part}"
+            )));
+        }
+    }
+
+    let iface = iface.ok_or_else(|| AgentdError::Config("MSB_NET missing iface=".into()))?;
+    let mac = mac.ok_or_else(|| AgentdError::Config("MSB_NET missing mac=".into()))?;
+
+    Ok(NetSpec { iface, mac, mtu })
+}
+
+/// Parses `MSB_NET_IPV4` value: `addr=A.B.C.D/N,gw=A.B.C.D[,dns=A.B.C.D]`
+fn parse_net_ipv4(val: &str) -> AgentdResult<NetIpv4Spec> {
+    let mut address = None;
+    let mut prefix_len = None;
+    let mut gateway = None;
+    let mut dns = None;
+
+    for part in val.split(',') {
+        if let Some(v) = part.strip_prefix("addr=") {
+            let (addr, prefix) = parse_cidr_v4(v)?;
+            address = Some(addr);
+            prefix_len = Some(prefix);
+        } else if let Some(v) = part.strip_prefix("gw=") {
+            gateway = Some(
+                v.parse::<Ipv4Addr>()
+                    .map_err(|_| AgentdError::Config(format!("invalid IPv4 gateway: {v}")))?,
+            );
+        } else if let Some(v) = part.strip_prefix("dns=") {
+            dns = Some(
+                v.parse::<Ipv4Addr>()
+                    .map_err(|_| AgentdError::Config(format!("invalid IPv4 DNS: {v}")))?,
+            );
+        } else {
+            return Err(AgentdError::Config(format!(
+                "unknown MSB_NET_IPV4 option: {part}"
+            )));
+        }
+    }
+
+    let address =
+        address.ok_or_else(|| AgentdError::Config("MSB_NET_IPV4 missing addr=".into()))?;
+    let prefix_len =
+        prefix_len.ok_or_else(|| AgentdError::Config("MSB_NET_IPV4 missing addr=".into()))?;
+    let gateway = gateway.ok_or_else(|| AgentdError::Config("MSB_NET_IPV4 missing gw=".into()))?;
+
+    Ok(NetIpv4Spec {
+        address,
+        prefix_len,
+        gateway,
+        dns,
+    })
+}
+
+/// Parses `MSB_NET_IPV6` value: `addr=ADDR/N,gw=ADDR[,dns=ADDR]`
+fn parse_net_ipv6(val: &str) -> AgentdResult<NetIpv6Spec> {
+    let mut address = None;
+    let mut prefix_len = None;
+    let mut gateway = None;
+    let mut dns = None;
+
+    for part in val.split(',') {
+        if let Some(v) = part.strip_prefix("addr=") {
+            let (addr, prefix) = parse_cidr_v6(v)?;
+            address = Some(addr);
+            prefix_len = Some(prefix);
+        } else if let Some(v) = part.strip_prefix("gw=") {
+            gateway = Some(
+                v.parse::<Ipv6Addr>()
+                    .map_err(|_| AgentdError::Config(format!("invalid IPv6 gateway: {v}")))?,
+            );
+        } else if let Some(v) = part.strip_prefix("dns=") {
+            dns = Some(
+                v.parse::<Ipv6Addr>()
+                    .map_err(|_| AgentdError::Config(format!("invalid IPv6 DNS: {v}")))?,
+            );
+        } else {
+            return Err(AgentdError::Config(format!(
+                "unknown MSB_NET_IPV6 option: {part}"
+            )));
+        }
+    }
+
+    let address =
+        address.ok_or_else(|| AgentdError::Config("MSB_NET_IPV6 missing addr=".into()))?;
+    let prefix_len =
+        prefix_len.ok_or_else(|| AgentdError::Config("MSB_NET_IPV6 missing addr=".into()))?;
+    let gateway = gateway.ok_or_else(|| AgentdError::Config("MSB_NET_IPV6 missing gw=".into()))?;
+
+    Ok(NetIpv6Spec {
+        address,
+        prefix_len,
+        gateway,
+        dns,
+    })
+}
+
+/// Parses a MAC address string like `02:5a:7b:13:01:02`.
+fn parse_mac(s: &str) -> AgentdResult<[u8; 6]> {
+    let mut mac = [0u8; 6];
+    let mut len = 0usize;
+    for (i, part) in s.split(':').enumerate() {
+        if i >= 6 {
+            return Err(AgentdError::Config(format!("invalid MAC address: {s}")));
+        }
+        mac[i] = u8::from_str_radix(part, 16)
+            .map_err(|_| AgentdError::Config(format!("invalid MAC octet: {part}")))?;
+        len = i + 1;
+    }
+    if len != 6 {
+        return Err(AgentdError::Config(format!("invalid MAC address: {s}")));
+    }
+    Ok(mac)
+}
+
+/// Parses an IPv4 CIDR like `100.96.1.2/30`.
+fn parse_cidr_v4(s: &str) -> AgentdResult<(Ipv4Addr, u8)> {
+    let (addr_str, prefix_str) = s
+        .split_once('/')
+        .ok_or_else(|| AgentdError::Config(format!("invalid IPv4 CIDR (missing /): {s}")))?;
+    let addr = addr_str
+        .parse::<Ipv4Addr>()
+        .map_err(|_| AgentdError::Config(format!("invalid IPv4 address: {addr_str}")))?;
+    let prefix = prefix_str
+        .parse::<u8>()
+        .map_err(|_| AgentdError::Config(format!("invalid IPv4 prefix length: {prefix_str}")))?;
+    if prefix > 32 {
+        return Err(AgentdError::Config(format!(
+            "IPv4 prefix length out of range (0-32): {prefix}"
+        )));
+    }
+    Ok((addr, prefix))
+}
+
+/// Parses an IPv6 CIDR like `fd42:6d73:62:2a::2/64`.
+fn parse_cidr_v6(s: &str) -> AgentdResult<(Ipv6Addr, u8)> {
+    let (addr_str, prefix_str) = s
+        .rsplit_once('/')
+        .ok_or_else(|| AgentdError::Config(format!("invalid IPv6 CIDR (missing /): {s}")))?;
+    let addr = addr_str
+        .parse::<Ipv6Addr>()
+        .map_err(|_| AgentdError::Config(format!("invalid IPv6 address: {addr_str}")))?;
+    let prefix = prefix_str
+        .parse::<u8>()
+        .map_err(|_| AgentdError::Config(format!("invalid IPv6 prefix length: {prefix_str}")))?;
+    if prefix > 128 {
+        return Err(AgentdError::Config(format!(
+            "IPv6 prefix length out of range (0-128): {prefix}"
+        )));
+    }
+    Ok((addr, prefix))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Parse Functions: Handoff Init
+//--------------------------------------------------------------------------------------------------
+
+/// Reads `MSB_HANDOFF_INIT[_ARGS|_ENV]` and assembles a [`HandoffInit`].
+///
+/// Returns `Ok(None)` when `MSB_HANDOFF_INIT` is unset/empty (the
+/// default no-handoff path). Returns `Err` when the cmd path is
+/// not absolute, or when `MSB_HANDOFF_INIT_ARGS` / `MSB_HANDOFF_INIT_ENV`
+/// contain invalid base64url JSON. The args/env payloads are the one
+/// structured exception to the delimiter-based `MSB_*` boot envs because
+/// they carry exact process argv/env strings.
+fn parse_handoff_init() -> AgentdResult<Option<HandoffInit>> {
+    let Some(cmd_str) = read_env_raw(ENV_HANDOFF_INIT) else {
+        return Ok(None);
+    };
+    if cmd_str.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let cmd = PathBuf::from(&cmd_str);
+    // The sentinel `auto` is resolved lazily in `handoff::do_handoff`
+    // by probing `HANDOFF_INIT_AUTO_CANDIDATES`; everything else must
+    // be an absolute path.
+    if cmd_str != HANDOFF_INIT_AUTO && !cmd.is_absolute() {
+        return Err(AgentdError::Config(format!(
+            "{ENV_HANDOFF_INIT} must be an absolute path or `auto`, got: {cmd_str}"
+        )));
+    }
+
+    let argv = match read_env_raw(ENV_HANDOFF_INIT_ARGS) {
+        Some(val) if !val.is_empty() => {
+            decode_handoff_json::<Vec<String>>(ENV_HANDOFF_INIT_ARGS, &val)?
+                .into_iter()
+                .enumerate()
+                .map(|(index, arg)| parse_handoff_arg(index, arg))
+                .collect::<AgentdResult<Vec<_>>>()?
+        }
+        _ => Vec::new(),
+    };
+
+    let cwd = match read_env_raw(ENV_HANDOFF_INIT_CWD) {
+        Some(val) if !val.is_empty() => {
+            let cwd = PathBuf::from(&val);
+            if !cwd.is_absolute() {
+                return Err(AgentdError::Config(format!(
+                    "{ENV_HANDOFF_INIT_CWD} must be an absolute path, got: {val}"
+                )));
+            }
+            Some(cwd)
+        }
+        _ => None,
+    };
+
+    let env = match read_env_raw(ENV_HANDOFF_INIT_ENV) {
+        Some(val) if !val.is_empty() => {
+            let entries = decode_handoff_json::<Vec<(String, String)>>(ENV_HANDOFF_INIT_ENV, &val)?;
+            entries
+                .into_iter()
+                .map(|(key, value)| parse_handoff_env_pair(key, value))
+                .collect::<AgentdResult<Vec<_>>>()?
+        }
+        _ => Vec::new(),
+    };
+
+    Ok(Some(HandoffInit {
+        cmd,
+        argv,
+        cwd,
+        env,
+    }))
+}
+
+fn decode_handoff_json<T: DeserializeOwned>(env_name: &str, value: &str) -> AgentdResult<T> {
+    let json = URL_SAFE_NO_PAD.decode(value).map_err(|e| {
+        AgentdError::Config(format!("{env_name} must be base64url-no-padding JSON: {e}"))
+    })?;
+    serde_json::from_slice(&json)
+        .map_err(|e| AgentdError::Config(format!("{env_name} contains invalid JSON: {e}")))
+}
+
+fn parse_handoff_arg(index: usize, arg: String) -> AgentdResult<OsString> {
+    if arg.contains('\0') {
+        return Err(AgentdError::Config(format!(
+            "{ENV_HANDOFF_INIT_ARGS} entry #{index} must not contain NUL"
+        )));
+    }
+    Ok(OsString::from(arg))
+}
+
+fn parse_handoff_env_pair(key: String, value: String) -> AgentdResult<(OsString, OsString)> {
+    if key.is_empty() {
+        return Err(AgentdError::Config(format!(
+            "{ENV_HANDOFF_INIT_ENV} entry has empty key"
+        )));
+    }
+    if key.contains('=') {
+        return Err(AgentdError::Config(format!(
+            "{ENV_HANDOFF_INIT_ENV} key {key:?} must not contain '='"
+        )));
+    }
+    if key.contains('\0') {
+        return Err(AgentdError::Config(format!(
+            "{ENV_HANDOFF_INIT_ENV} key {key:?} must not contain NUL"
+        )));
+    }
+    if value.contains('\0') {
+        return Err(AgentdError::Config(format!(
+            "{ENV_HANDOFF_INIT_ENV} value for {key:?} must not contain NUL"
+        )));
+    }
+    Ok((OsString::from(key), OsString::from(value)))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Helper Functions
+//--------------------------------------------------------------------------------------------------
+
+fn validate_guest_bootstrap(bootstrap: &GuestBootstrap) -> AgentdResult<()> {
+    if let Some(root) = &bootstrap.block_root {
+        match root {
+            BootstrapBlockRoot::DiskImage { device, fstype } => {
+                validate_absolute_guest_path("bootstrap block-root device", device)?;
+                if let Some(fstype) = fstype {
+                    validate_nonempty_bootstrap_string("bootstrap block-root fstype", fstype)?;
+                }
+            }
+            BootstrapBlockRoot::OciErofs { lower, upper } => {
+                validate_absolute_guest_path("bootstrap EROFS lower device", lower)?;
+                match upper {
+                    BootstrapBlockRootUpper::Device { device, fstype } => {
+                        validate_absolute_guest_path("bootstrap upper device", device)?;
+                        validate_nonempty_bootstrap_string("bootstrap upper fstype", fstype)?;
+                    }
+                    BootstrapBlockRootUpper::Tmpfs { .. } => {}
+                }
+            }
+        }
+    }
+
+    for mount in &bootstrap.dir_mounts {
+        validate_nonempty_bootstrap_string("bootstrap directory mount tag", &mount.tag)?;
+        validate_absolute_guest_path("bootstrap directory mount path", &mount.guest_path)?;
+    }
+    for mount in &bootstrap.file_mounts {
+        validate_nonempty_bootstrap_string("bootstrap file mount tag", &mount.tag)?;
+        validate_nonempty_bootstrap_string("bootstrap file mount filename", &mount.filename)?;
+        validate_absolute_guest_path("bootstrap file mount path", &mount.guest_path)?;
+    }
+    for mount in &bootstrap.disk_mounts {
+        validate_nonempty_bootstrap_string("bootstrap disk mount id", &mount.id)?;
+        validate_absolute_guest_path("bootstrap disk mount path", &mount.guest_path)?;
+        if let Some(fstype) = &mount.fstype {
+            validate_nonempty_bootstrap_string("bootstrap disk mount fstype", fstype)?;
+        }
+    }
+    for mount in &bootstrap.tmpfs_mounts {
+        validate_absolute_guest_path("bootstrap tmpfs path", &mount.path)?;
+    }
+
+    if let Some(hostname) = &bootstrap.hostname {
+        validate_nonempty_bootstrap_string("bootstrap hostname", hostname)?;
+    }
+    if let Some(host_alias) = &bootstrap.host_alias {
+        validate_nonempty_bootstrap_string("bootstrap host alias", host_alias)?;
+    }
+    if let Some(network) = &bootstrap.network {
+        validate_nonempty_bootstrap_string("bootstrap network interface", &network.interface)?;
+        if let Some(ipv4) = network.ipv4
+            && ipv4.prefix_len > 32
+        {
+            return Err(AgentdError::Config(format!(
+                "bootstrap IPv4 prefix length out of range: {}",
+                ipv4.prefix_len
+            )));
+        }
+        if let Some(ipv6) = network.ipv6
+            && ipv6.prefix_len > 128
+        {
+            return Err(AgentdError::Config(format!(
+                "bootstrap IPv6 prefix length out of range: {}",
+                ipv6.prefix_len
+            )));
+        }
+    }
+
+    let mut seen_rlimits = Vec::new();
+    for rlimit in &bootstrap.rlimits {
+        if rlimit::parse_rlimit_resource(&rlimit.resource).is_none() {
+            return Err(AgentdError::Config(format!(
+                "bootstrap rlimits contains unknown resource: {}",
+                rlimit.resource
+            )));
+        }
+        if rlimit.soft > rlimit.hard {
+            return Err(AgentdError::Config(format!(
+                "bootstrap rlimit {} has soft limit above hard limit",
+                rlimit.resource
+            )));
+        }
+        if seen_rlimits.iter().any(|name| name == &rlimit.resource) {
+            return Err(AgentdError::Config(format!(
+                "bootstrap rlimits contains duplicate resource: {}",
+                rlimit.resource
+            )));
+        }
+        seen_rlimits.push(rlimit.resource.clone());
+    }
+
+    if let Some(user) = &bootstrap.user {
+        validate_nonempty_bootstrap_string("bootstrap user", user)?;
+    }
+    if let Some(cwd) = &bootstrap.default_cwd {
+        validate_nonempty_bootstrap_string("bootstrap default cwd", cwd)?;
+    }
+    for variable in &bootstrap.default_env {
+        validate_bootstrap_env("bootstrap default env", variable)?;
+    }
+    if let Some(handoff) = &bootstrap.handoff_init {
+        validate_bootstrap_handoff(handoff)?;
+    }
+
+    Ok(())
+}
+
+fn validate_bootstrap_handoff(handoff: &BootstrapHandoffInit) -> AgentdResult<()> {
+    if handoff.cmd.contains('\0') {
+        return Err(AgentdError::Config(
+            "bootstrap handoff command must not contain NUL".into(),
+        ));
+    }
+    if handoff.cmd != HANDOFF_INIT_AUTO && !handoff.cmd.starts_with('/') {
+        return Err(AgentdError::Config(format!(
+            "bootstrap handoff command must be absolute or `auto`: {}",
+            handoff.cmd
+        )));
+    }
+    for (index, arg) in handoff.args.iter().enumerate() {
+        if arg.contains('\0') {
+            return Err(AgentdError::Config(format!(
+                "bootstrap handoff argument #{index} must not contain NUL"
+            )));
+        }
+    }
+    if let Some(cwd) = &handoff.cwd {
+        validate_absolute_guest_path("bootstrap handoff cwd", cwd)?;
+    }
+    for variable in &handoff.env {
+        validate_bootstrap_env("bootstrap handoff env", variable)?;
+    }
+    Ok(())
+}
+
+fn validate_bootstrap_env(label: &str, variable: &BootstrapEnvVar) -> AgentdResult<()> {
+    if variable.key.is_empty() {
+        return Err(AgentdError::Config(format!(
+            "{label} contains an empty key"
+        )));
+    }
+    if variable.key.contains('=') || variable.key.contains('\0') {
+        return Err(AgentdError::Config(format!(
+            "{label} key {:?} must not contain '=' or NUL",
+            variable.key
+        )));
+    }
+    if variable.value.contains('\0') {
+        return Err(AgentdError::Config(format!(
+            "{label} value for {:?} must not contain NUL",
+            variable.key
+        )));
+    }
+    Ok(())
+}
+
+fn validate_absolute_guest_path(label: &str, value: &str) -> AgentdResult<()> {
+    validate_nonempty_bootstrap_string(label, value)?;
+    if !value.starts_with('/') {
+        return Err(AgentdError::Config(format!(
+            "{label} must be an absolute Linux path: {value}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nonempty_bootstrap_string(label: &str, value: &str) -> AgentdResult<()> {
+    if value.is_empty() || value.contains('\0') {
+        return Err(AgentdError::Config(format!(
+            "{label} must be non-empty and must not contain NUL"
+        )));
+    }
+    Ok(())
+}
+
+fn convert_bootstrap_handoff(handoff: BootstrapHandoffInit) -> AgentdResult<HandoffInit> {
+    Ok(HandoffInit {
+        cmd: PathBuf::from(handoff.cmd),
+        argv: handoff.args.into_iter().map(OsString::from).collect(),
+        cwd: handoff.cwd.map(PathBuf::from),
+        env: handoff
+            .env
+            .into_iter()
+            .map(|variable| (OsString::from(variable.key), OsString::from(variable.value)))
+            .collect(),
+    })
+}
+
+/// Reads a single environment variable, returning `None` for missing or empty values.
+fn read_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Reads a single environment variable without trimming whitespace.
+///
+/// Used for the handoff-init vars where argv content is sensitive to
+/// byte-exact preservation.
+fn read_env_raw(key: &str) -> Option<String> {
+    env::var(key).ok().filter(|v| !v.is_empty())
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------------------------------------
+    // Typed Bootstrap
+    // ---------------------------------------------------------------------------------------------
+
+    #[test]
+    fn test_scripts_path_uses_stable_default_and_avoids_duplicates() {
+        assert_eq!(
+            scripts_path(None),
+            "/.msb/scripts:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        );
+        assert_eq!(
+            scripts_path(Some("/custom/bin:/bin")),
+            "/.msb/scripts:/custom/bin:/bin"
+        );
+        assert_eq!(
+            scripts_path(Some("/bin:/.msb/scripts:/usr/bin")),
+            "/bin:/.msb/scripts:/usr/bin"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_preserves_structured_environment_and_handoff_values() {
+        let bootstrap = GuestBootstrap {
+            hostname: Some("quoted-host".to_string()),
+            network: Some(microsandbox_protocol::bootstrap::BootstrapNetwork {
+                interface: "eth0".to_string(),
+                mac: [0x02, 0x5a, 0x7b, 0x13, 0x01, 0x02],
+                mtu: 1500,
+                ipv4: None,
+                ipv6: None,
+            }),
+            rlimits: vec![ExecRlimit {
+                resource: "nofile".to_string(),
+                soft: 4096,
+                hard: 65_535,
+            }],
+            user: Some("1000:1000".to_string()),
+            default_cwd: Some("/workspace".to_string()),
+            default_env: vec![BootstrapEnvVar {
+                key: "APP_CONFIG".to_string(),
+                value: "{\"message\":\"hello\",\"unicode\":\"lambda λ\"}\nnext\tline=a=b"
+                    .to_string(),
+            }],
+            security_profile: BootstrapSecurityProfile::Restricted,
+            handoff_init: Some(BootstrapHandoffInit {
+                cmd: "/sbin/init".to_string(),
+                args: vec!["--label=\"hello world\"".to_string()],
+                cwd: Some("/workspace".to_string()),
+                env: vec![BootstrapEnvVar {
+                    key: "INIT_CONFIG".to_string(),
+                    value: "{\"enabled\":true}".to_string(),
+                }],
+            }),
+            ..GuestBootstrap::default()
+        };
+
+        let (boot, config) = BootParams::from_bootstrap(bootstrap).unwrap();
+
+        assert_eq!(boot.hostname.as_deref(), Some("quoted-host"));
+        assert_eq!(boot.rlimits[0].hard, 65_535);
+        assert!(matches!(boot.security_profile, SecurityProfile::Restricted));
+        assert_eq!(config.user.as_deref(), Some("1000:1000"));
+        assert_eq!(config.default_cwd.as_deref(), Some("/workspace"));
+        assert_eq!(
+            config.default_env[0].value,
+            "{\"message\":\"hello\",\"unicode\":\"lambda λ\"}\nnext\tline=a=b"
+        );
+
+        let handoff = boot.handoff_init.expect("handoff bootstrap");
+        assert_eq!(
+            handoff.argv,
+            vec![OsString::from("--label=\"hello world\"")]
+        );
+        assert_eq!(
+            handoff.env,
+            vec![(
+                OsString::from("INIT_CONFIG"),
+                OsString::from("{\"enabled\":true}")
+            )]
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_accepts_relative_default_cwd() {
+        let bootstrap = GuestBootstrap {
+            default_cwd: Some("workspace".to_string()),
+            ..GuestBootstrap::default()
+        };
+
+        let (_, config) = BootParams::from_bootstrap(bootstrap).unwrap();
+
+        assert_eq!(config.default_cwd.as_deref(), Some("workspace"));
+    }
+
+    #[test]
+    fn test_bootstrap_rejects_duplicate_rlimits() {
+        let rlimit = ExecRlimit {
+            resource: "nofile".to_string(),
+            soft: 1024,
+            hard: 1024,
+        };
+        let bootstrap = GuestBootstrap {
+            rlimits: vec![rlimit.clone(), rlimit],
+            ..GuestBootstrap::default()
+        };
+
+        let error = BootParams::from_bootstrap(bootstrap).unwrap_err();
+        assert!(error.to_string().contains("duplicate resource"));
+    }
+
+    #[test]
+    fn test_bootstrap_rejects_invalid_environment_key() {
+        let bootstrap = GuestBootstrap {
+            default_env: vec![BootstrapEnvVar {
+                key: "BAD=KEY".to_string(),
+                value: "value".to_string(),
+            }],
+            ..GuestBootstrap::default()
+        };
+
+        let error = BootParams::from_bootstrap(bootstrap).unwrap_err();
+        assert!(error.to_string().contains("must not contain '=' or NUL"));
+    }
+
+    // ── Block Root ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_block_root_disk_image() {
+        let spec = parse_block_root("kind=disk-image,device=/dev/vda,fstype=ext4").unwrap();
+        let BlockRootSpec::DiskImage { device, fstype } = spec else {
+            panic!("expected DiskImage");
+        };
+        assert_eq!(device, "/dev/vda");
+        assert_eq!(fstype.as_deref(), Some("ext4"));
+    }
+
+    #[test]
+    fn test_parse_block_root_disk_image_no_fstype() {
+        let spec = parse_block_root("kind=disk-image,device=/dev/vda").unwrap();
+        let BlockRootSpec::DiskImage { device, fstype } = spec else {
+            panic!("expected DiskImage");
+        };
+        assert_eq!(device, "/dev/vda");
+        assert_eq!(fstype, None);
+    }
+
+    #[test]
+    fn test_parse_block_root_oci_erofs() {
+        let spec =
+            parse_block_root("kind=oci-erofs,lower=/dev/vda,upper=/dev/vdb,upper_fstype=ext4")
+                .unwrap();
+        let BlockRootSpec::OciErofs { lower, upper } = spec else {
+            panic!("expected OciErofs");
+        };
+        assert_eq!(lower, "/dev/vda");
+        let BlockRootUpper::Device { device, fstype } = upper else {
+            panic!("expected Device upper");
+        };
+        assert_eq!(device, "/dev/vdb");
+        assert_eq!(fstype, "ext4");
+    }
+
+    #[test]
+    fn test_parse_block_root_oci_erofs_tmpfs_upper() {
+        let spec =
+            parse_block_root("kind=oci-erofs,lower=/dev/vda,upper=tmpfs,upper_size_mib=2048")
+                .unwrap();
+        let BlockRootSpec::OciErofs { lower, upper } = spec else {
+            panic!("expected OciErofs");
+        };
+        assert_eq!(lower, "/dev/vda");
+        let BlockRootUpper::Tmpfs { size_mib } = upper else {
+            panic!("expected Tmpfs upper");
+        };
+        assert_eq!(size_mib, Some(2048));
+    }
+
+    #[test]
+    fn test_parse_block_root_oci_erofs_tmpfs_upper_no_size() {
+        let spec = parse_block_root("kind=oci-erofs,lower=/dev/vda,upper=tmpfs").unwrap();
+        let BlockRootSpec::OciErofs {
+            upper: BlockRootUpper::Tmpfs { size_mib: None },
+            ..
+        } = spec
+        else {
+            panic!("expected Tmpfs upper without size");
+        };
+    }
+
+    #[test]
+    fn test_parse_block_root_oci_erofs_tmpfs_upper_rejects_fstype() {
+        let err = parse_block_root("kind=oci-erofs,lower=/dev/vda,upper=tmpfs,upper_fstype=ext4")
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid with upper=tmpfs"));
+    }
+
+    #[test]
+    fn test_parse_block_root_oci_erofs_tmpfs_upper_invalid_size_errors() {
+        let err = parse_block_root("kind=oci-erofs,lower=/dev/vda,upper=tmpfs,upper_size_mib=big")
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid upper_size_mib"));
+    }
+
+    #[test]
+    fn test_parse_block_root_unknown_kind_errors() {
+        let err = parse_block_root("kind=bogus,device=/dev/vda").unwrap_err();
+        assert!(err.to_string().contains("unknown kind"));
+    }
+
+    #[test]
+    fn test_parse_block_root_missing_kind_errors() {
+        let err = parse_block_root("/dev/vda").unwrap_err();
+        assert!(err.to_string().contains("missing 'kind' key"));
+    }
+
+    #[test]
+    fn test_parse_block_root_disk_image_missing_device_errors() {
+        let err = parse_block_root("kind=disk-image").unwrap_err();
+        assert!(err.to_string().contains("missing 'device'"));
+    }
+
+    #[test]
+    fn test_parse_block_root_oci_erofs_missing_upper_errors() {
+        let err = parse_block_root("kind=oci-erofs,lower=/dev/vda,upper_fstype=ext4").unwrap_err();
+        assert!(err.to_string().contains("missing 'upper'"));
+    }
+
+    #[test]
+    fn test_parse_block_root_duplicate_key_errors() {
+        let err = parse_block_root("kind=disk-image,device=/dev/vda,device=/dev/vdb").unwrap_err();
+        assert!(err.to_string().contains("duplicate key 'device'"));
+    }
+
+    // ── File Mounts ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_file_mount_entry_basic() {
+        let spec = parse_file_mount_entry("fm_config:app.conf:/etc/app.conf").unwrap();
+        assert_eq!(spec.tag, "fm_config");
+        assert_eq!(spec.filename, "app.conf");
+        assert_eq!(spec.guest_path, "/etc/app.conf");
+        assert!(!spec.readonly);
+        assert!(!spec.noexec);
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_readonly() {
+        let spec = parse_file_mount_entry("fm_config:app.conf:/etc/app.conf:ro,noexec").unwrap();
+        assert!(spec.readonly);
+        assert!(spec.noexec);
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_too_few_parts() {
+        assert!(parse_file_mount_entry("fm_config:/etc/app.conf").is_err());
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_empty_filename() {
+        assert!(parse_file_mount_entry("fm_config::/etc/app.conf").is_err());
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_relative_path() {
+        assert!(parse_file_mount_entry("fm_config:app.conf:relative/path").is_err());
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_too_many_parts() {
+        assert!(parse_file_mount_entry("fm_config:app.conf:/etc/app.conf:ro:extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_unknown_flag() {
+        assert!(parse_file_mount_entry("fm_config:app.conf:/etc/app.conf:exec").is_err());
+    }
+
+    #[test]
+    fn test_parse_file_mount_entry_empty_tag() {
+        assert!(parse_file_mount_entry(":app.conf:/etc/app.conf").is_err());
+    }
+
+    // ── Tmpfs ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_path_only() {
+        let spec = parse_tmpfs_entry("/tmp").unwrap();
+        assert_eq!(spec.path, "/tmp");
+        assert_eq!(spec.size_mib, None);
+        assert_eq!(spec.mode, None);
+        assert!(!spec.noexec);
+    }
+
+    #[test]
+    fn test_parse_with_size() {
+        let spec = parse_tmpfs_entry("/tmp:size=256").unwrap();
+        assert_eq!(spec.path, "/tmp");
+        assert_eq!(spec.size_mib, Some(256));
+    }
+
+    #[test]
+    fn test_parse_with_noexec() {
+        let spec = parse_tmpfs_entry("/tmp:noexec").unwrap();
+        assert_eq!(spec.path, "/tmp");
+        assert!(spec.noexec);
+    }
+
+    // ── Disk Mounts ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_disk_mount_entry_basic() {
+        let spec = parse_disk_mount_entry("data_abc:/data:fstype=ext4").unwrap();
+        assert_eq!(spec.id, "data_abc");
+        assert_eq!(spec.guest_path, "/data");
+        assert_eq!(spec.fstype.as_deref(), Some("ext4"));
+        assert!(!spec.readonly);
+        assert!(!spec.noexec);
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_readonly() {
+        let spec = parse_disk_mount_entry("seed_7f:/seed:ro,noexec,fstype=ext4").unwrap();
+        assert!(spec.readonly);
+        assert!(spec.noexec);
+        assert_eq!(spec.fstype.as_deref(), Some("ext4"));
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_no_fstype_means_autodetect() {
+        let spec = parse_disk_mount_entry("probe_1:/data:ro").unwrap();
+        assert!(spec.fstype.is_none());
+        assert!(spec.readonly);
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_autodetect_no_ro() {
+        let spec = parse_disk_mount_entry("probe_1:/data").unwrap();
+        assert!(spec.fstype.is_none());
+        assert!(!spec.readonly);
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_rejects_unknown_flag() {
+        let err = parse_disk_mount_entry("id:/data:exec").unwrap_err();
+        assert!(err.to_string().contains("unsupported mount option"));
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_rejects_relative_path() {
+        assert!(parse_disk_mount_entry("id:relative").is_err());
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_rejects_empty_id() {
+        assert!(parse_disk_mount_entry(":/data:fstype=ext4").is_err());
+    }
+
+    #[test]
+    fn test_parse_disk_mount_entry_rejects_too_many_parts() {
+        assert!(parse_disk_mount_entry("id:/data:fstype=ext4:extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_disk_mounts_multiple_entries() {
+        let specs =
+            parse_disk_mounts("data_1:/data:fstype=ext4;seed_2:/seed:ro;probe_3:/p").unwrap();
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].guest_path, "/data");
+        assert!(specs[1].readonly);
+        assert!(specs[2].fstype.is_none());
+    }
+
+    #[test]
+    fn test_parse_with_ro() {
+        let spec = parse_tmpfs_entry("/seed:size=64,ro").unwrap();
+        assert_eq!(spec.path, "/seed");
+        assert_eq!(spec.size_mib, Some(64));
+        assert!(spec.readonly);
+        assert!(!spec.noexec);
+    }
+
+    #[test]
+    fn test_parse_ro_defaults_to_false_when_absent() {
+        let spec = parse_tmpfs_entry("/tmp:size=256").unwrap();
+        assert!(!spec.readonly);
+    }
+
+    #[test]
+    fn test_parse_with_octal_mode() {
+        let spec = parse_tmpfs_entry("/tmp:mode=1777").unwrap();
+        assert_eq!(spec.mode, Some(0o1777));
+
+        let spec = parse_tmpfs_entry("/data:mode=755").unwrap();
+        assert_eq!(spec.mode, Some(0o755));
+    }
+
+    #[test]
+    fn test_parse_multi_options() {
+        let spec = parse_tmpfs_entry("/tmp:size=256,mode=1777,noexec").unwrap();
+        assert_eq!(spec.path, "/tmp");
+        assert_eq!(spec.size_mib, Some(256));
+        assert_eq!(spec.mode, Some(0o1777));
+        assert!(spec.noexec);
+    }
+
+    #[test]
+    fn test_parse_unknown_option_errors() {
+        let err = parse_tmpfs_entry("/tmp:bogus=42").unwrap_err();
+        assert!(err.to_string().contains("unknown mount option"));
+    }
+
+    #[test]
+    fn test_parse_invalid_size_errors() {
+        let err = parse_tmpfs_entry("/tmp:size=abc").unwrap_err();
+        assert!(err.to_string().contains("invalid tmpfs size"));
+    }
+
+    #[test]
+    fn test_parse_invalid_mode_errors() {
+        let err = parse_tmpfs_entry("/tmp:mode=zzz").unwrap_err();
+        assert!(err.to_string().contains("invalid octal tmpfs mode"));
+    }
+
+    #[test]
+    fn test_parse_empty_path_errors() {
+        let err = parse_tmpfs_entry(":size=256").unwrap_err();
+        assert!(err.to_string().contains("empty path"));
+    }
+
+    // ── Network ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_net_full() {
+        let spec = parse_net("iface=eth0,mac=02:5a:7b:13:01:02,mtu=1500").unwrap();
+        assert_eq!(spec.iface, "eth0");
+        assert_eq!(spec.mac, [0x02, 0x5a, 0x7b, 0x13, 0x01, 0x02]);
+        assert_eq!(spec.mtu, 1500);
+    }
+
+    #[test]
+    fn test_parse_net_default_mtu() {
+        let spec = parse_net("iface=eth0,mac=02:00:00:00:00:01").unwrap();
+        assert_eq!(spec.mtu, 1500);
+    }
+
+    #[test]
+    fn test_parse_net_missing_iface() {
+        assert!(parse_net("mac=02:00:00:00:00:01").is_err());
+    }
+
+    #[test]
+    fn test_parse_net_missing_mac() {
+        assert!(parse_net("iface=eth0").is_err());
+    }
+
+    #[test]
+    fn test_parse_net_unknown_option() {
+        assert!(parse_net("iface=eth0,mac=02:00:00:00:00:01,bogus=42").is_err());
+    }
+
+    #[test]
+    fn test_parse_net_ipv4() {
+        let spec = parse_net_ipv4("addr=100.96.1.2/30,gw=100.96.1.1,dns=100.96.1.1").unwrap();
+        assert_eq!(spec.address, Ipv4Addr::new(100, 96, 1, 2));
+        assert_eq!(spec.prefix_len, 30);
+        assert_eq!(spec.gateway, Ipv4Addr::new(100, 96, 1, 1));
+        assert_eq!(spec.dns, Some(Ipv4Addr::new(100, 96, 1, 1)));
+    }
+
+    #[test]
+    fn test_parse_net_ipv4_no_dns() {
+        let spec = parse_net_ipv4("addr=10.0.0.2/24,gw=10.0.0.1").unwrap();
+        assert_eq!(spec.dns, None);
+    }
+
+    #[test]
+    fn test_parse_net_ipv4_missing_addr() {
+        assert!(parse_net_ipv4("gw=10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn test_parse_net_ipv6() {
+        let spec = parse_net_ipv6(
+            "addr=fd42:6d73:62:2a::2/64,gw=fd42:6d73:62:2a::1,dns=fd42:6d73:62:2a::1",
+        )
+        .unwrap();
+        assert_eq!(
+            spec.address,
+            "fd42:6d73:62:2a::2".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(spec.prefix_len, 64);
+        assert_eq!(
+            spec.gateway,
+            "fd42:6d73:62:2a::1".parse::<Ipv6Addr>().unwrap()
+        );
+        assert!(spec.dns.is_some());
+    }
+
+    #[test]
+    fn test_parse_mac_valid() {
+        let mac = parse_mac("02:5a:7b:13:01:02").unwrap();
+        assert_eq!(mac, [0x02, 0x5a, 0x7b, 0x13, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn test_parse_mac_invalid() {
+        assert!(parse_mac("02:5a:7b").is_err());
+        assert!(parse_mac("zz:00:00:00:00:00").is_err());
+    }
+
+    #[test]
+    fn test_parse_cidr_v4() {
+        let (addr, prefix) = parse_cidr_v4("100.96.1.2/30").unwrap();
+        assert_eq!(addr, Ipv4Addr::new(100, 96, 1, 2));
+        assert_eq!(prefix, 30);
+    }
+
+    #[test]
+    fn test_parse_cidr_v6() {
+        let (addr, prefix) = parse_cidr_v6("fd42:6d73:62:2a::2/64").unwrap();
+        assert_eq!(addr, "fd42:6d73:62:2a::2".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(prefix, 64);
+    }
+
+    // ── Rlimits ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_rlimits_happy_path() {
+        let rlimits = parse_rlimits("nofile=65535;nproc=4096:8192").unwrap();
+        assert_eq!(rlimits.len(), 2);
+        assert_eq!(rlimits[0].resource, "nofile");
+        assert_eq!(rlimits[0].soft, 65535);
+        assert_eq!(rlimits[0].hard, 65535);
+        assert_eq!(rlimits[1].resource, "nproc");
+        assert_eq!(rlimits[1].soft, 4096);
+        assert_eq!(rlimits[1].hard, 8192);
+    }
+
+    #[test]
+    fn test_parse_rlimits_ignores_empty_entries() {
+        let rlimits = parse_rlimits("nofile=1024;").unwrap();
+        assert_eq!(rlimits.len(), 1);
+        assert_eq!(rlimits[0].resource, "nofile");
+    }
+
+    #[test]
+    fn test_parse_rlimits_rejects_unknown_resource() {
+        let err = parse_rlimits("bogus=1024").unwrap_err();
+        assert!(
+            matches!(err, AgentdError::Config(msg) if msg.contains("unknown resource: bogus")),
+            "unexpected error shape"
+        );
+    }
+
+    #[test]
+    fn test_parse_rlimits_rejects_duplicate_resource() {
+        let err = parse_rlimits("nofile=1024;nofile=65535").unwrap_err();
+        assert!(
+            matches!(err, AgentdError::Config(msg) if msg.contains("duplicate resource: nofile")),
+            "unexpected error shape"
+        );
+    }
+
+    #[test]
+    fn test_parse_rlimits_rejects_malformed_entry() {
+        assert!(parse_rlimits("nofile").is_err());
+        assert!(parse_rlimits("nofile=abc").is_err());
+        assert!(parse_rlimits("nofile=65535:1024").is_err()); // soft > hard
+    }
+
+    // ── Handoff Init ──────────────────────────────────────────────────
+
+    /// Mutex serialising tests that touch `MSB_HANDOFF_INIT*` env vars,
+    /// since `parse_handoff_init` reads them from the process env.
+    static HANDOFF_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_handoff_env<R>(
+        cmd: Option<&str>,
+        args: Option<&str>,
+        cwd: Option<&str>,
+        env_var: Option<&str>,
+        f: impl FnOnce() -> R,
+    ) -> R {
+        let _guard = HANDOFF_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            match cmd {
+                Some(v) => env::set_var(ENV_HANDOFF_INIT, v),
+                None => env::remove_var(ENV_HANDOFF_INIT),
+            }
+            match args {
+                Some(v) => env::set_var(ENV_HANDOFF_INIT_ARGS, v),
+                None => env::remove_var(ENV_HANDOFF_INIT_ARGS),
+            }
+            match cwd {
+                Some(v) => env::set_var(ENV_HANDOFF_INIT_CWD, v),
+                None => env::remove_var(ENV_HANDOFF_INIT_CWD),
+            }
+            match env_var {
+                Some(v) => env::set_var(ENV_HANDOFF_INIT_ENV, v),
+                None => env::remove_var(ENV_HANDOFF_INIT_ENV),
+            }
+        }
+        let out = f();
+        unsafe {
+            env::remove_var(ENV_HANDOFF_INIT);
+            env::remove_var(ENV_HANDOFF_INIT_ARGS);
+            env::remove_var(ENV_HANDOFF_INIT_CWD);
+            env::remove_var(ENV_HANDOFF_INIT_ENV);
+        }
+        out
+    }
+
+    fn encode_handoff_json<T: serde::Serialize>(value: &T) -> String {
+        use base64::Engine as _;
+
+        let json = serde_json::to_vec(value).unwrap();
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    }
+
+    #[test]
+    fn test_parse_handoff_init_unset_returns_none() {
+        let res = with_handoff_env(None, None, None, None, parse_handoff_init).unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_parse_handoff_init_empty_returns_none() {
+        let res = with_handoff_env(Some(""), None, None, None, parse_handoff_init).unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_parse_handoff_init_cmd_only() {
+        let res = with_handoff_env(
+            Some("/lib/systemd/systemd"),
+            None,
+            None,
+            None,
+            parse_handoff_init,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(res.cmd, PathBuf::from("/lib/systemd/systemd"));
+        assert!(res.argv.is_empty());
+        assert!(res.env.is_empty());
+    }
+
+    #[test]
+    fn test_parse_handoff_init_with_argv() {
+        let argv = encode_handoff_json(&vec!["--unit=multi-user.target", "--log-level=warning"]);
+        let res = with_handoff_env(
+            Some("/lib/systemd/systemd"),
+            Some(&argv),
+            None,
+            None,
+            parse_handoff_init,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            res.argv,
+            vec![
+                OsString::from("--unit=multi-user.target"),
+                OsString::from("--log-level=warning"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_handoff_init_with_env() {
+        let envs = encode_handoff_json(&vec![("container", "microsandbox"), ("LANG", "C.UTF-8")]);
+        let res = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some(&envs),
+            parse_handoff_init,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            res.env,
+            vec![
+                (OsString::from("container"), OsString::from("microsandbox")),
+                (OsString::from("LANG"), OsString::from("C.UTF-8")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_handoff_init_with_cwd() {
+        let res = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            Some("/opt/hermes"),
+            None,
+            parse_handoff_init,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(res.cwd, Some(PathBuf::from("/opt/hermes")));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_argv_with_spaces_preserved() {
+        let argv = encode_handoff_json(&vec![
+            "--label=hello world",
+            "--config=/etc/foo;bar",
+            "old\x1fseparator",
+        ]);
+        let res = with_handoff_env(
+            Some("/sbin/init"),
+            Some(&argv),
+            None,
+            None,
+            parse_handoff_init,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            res.argv,
+            vec![
+                OsString::from("--label=hello world"),
+                OsString::from("--config=/etc/foo;bar"),
+                OsString::from("old\x1fseparator"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_handoff_init_rejects_relative_path() {
+        let err =
+            with_handoff_env(Some("sbin/init"), None, None, None, parse_handoff_init).unwrap_err();
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_env_rejects_invalid_base64() {
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some("not base64!"),
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("base64url-no-padding JSON"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_cwd_rejects_relative_path() {
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            Some("opt/hermes"),
+            None,
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("absolute path"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_env_entry_empty_key_rejected() {
+        let envs = encode_handoff_json(&vec![("", "value")]);
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some(&envs),
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty key"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_arg_rejects_nul() {
+        let argv = encode_handoff_json(&vec!["ok", "bad\0arg"]);
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            Some(&argv),
+            None,
+            None,
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("entry #1"));
+        assert!(err.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_env_key_rejects_equals() {
+        let envs = encode_handoff_json(&vec![("BAD=KEY", "value")]);
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some(&envs),
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must not contain '='"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_env_key_rejects_nul() {
+        let envs = encode_handoff_json(&vec![("BAD\0KEY", "value")]);
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some(&envs),
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("key"));
+        assert!(err.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_env_value_rejects_nul() {
+        let envs = encode_handoff_json(&vec![("KEY", "bad\0value")]);
+        let err = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some(&envs),
+            parse_handoff_init,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("value for"));
+        assert!(err.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn test_parse_handoff_init_env_value_with_equals_is_value() {
+        let envs = encode_handoff_json(&vec![("PATH", "/a:/b=/c")]);
+        let res = with_handoff_env(
+            Some("/sbin/init"),
+            None,
+            None,
+            Some(&envs),
+            parse_handoff_init,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            res.env,
+            vec![(OsString::from("PATH"), OsString::from("/a:/b=/c"))]
+        );
+    }
+}

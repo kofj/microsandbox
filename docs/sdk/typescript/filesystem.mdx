@@ -1,0 +1,621 @@
+---
+title: Filesystem
+description: TypeScript SDK - Filesystem API reference
+keywords: ["TypeScript SDK", "TypeScript filesystem", "microsandbox filesystem"]
+---
+
+Read and write files inside a running sandbox. See [Filesystem](/sandboxes/filesystem) for usage examples.
+
+## SandboxFsOps
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">read()</span>
+
+```typescript
+read(path: string): Promise<Uint8Array>
+```
+
+<Accordion title="Example">
+
+```typescript
+const bytes = await fs.read("/app/logo.png");
+console.log(`${bytes.byteLength} bytes`);
+```
+
+</Accordion>
+
+Read the entire contents of a file as raw bytes.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest (e.g. <code>"/app/config.json"</code>).</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Promise&lt;Uint8Array&gt;</span></div>
+    <div className="msb-param-desc">File contents as raw bytes.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">readToString()</span>
+
+```typescript
+readToString(path: string): Promise<string>
+```
+
+<Accordion title="Example">
+
+```typescript
+const text = await fs.readToString("/etc/hostname");
+console.log(text.trim());
+```
+
+</Accordion>
+
+Read the entire contents of a file and decode it as UTF-8.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Promise&lt;string&gt;</span></div>
+    <div className="msb-param-desc">File contents as a string.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">write()</span>
+
+```typescript
+write(path: string, data: Uint8Array | string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.write("/tmp/config.json", '{"debug": true}');
+```
+
+</Accordion>
+
+Write content to a file, creating it if it doesn't exist and overwriting if it does. Parent directories must already exist. `string` payloads are encoded as UTF-8.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>data</code><span className="msb-type">Uint8Array | string</span></div>
+    <div className="msb-param-desc">File content. Strings are written as UTF-8.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">readStream()</span>
+
+```typescript
+readStream(path: string): Promise<FsReadStream>
+```
+
+<Accordion title="Example">
+
+```typescript
+for await (const chunk of await fs.readStream("/var/log/syslog")) {
+  process.stdout.write(chunk); // chunk is a Uint8Array
+}
+```
+
+</Accordion>
+
+Open a streaming reader for a file. Data is transferred in chunks. Use this for files too large to fit in memory. The returned [`FsReadStream`](#fsreadstream) is an `AsyncIterable<Uint8Array>`, so it works with `for await...of`.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#fsreadstream">Promise&lt;FsReadStream&gt;</a></div>
+    <div className="msb-param-desc">Async stream that yields chunks of file data.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">writeStream()</span>
+
+```typescript
+writeStream(path: string): Promise<FsWriteSink>
+```
+
+<Accordion title="Example">
+
+```typescript
+await using sink = await fs.writeStream("/tmp/big.bin");
+await sink.write(new Uint8Array(1 << 20));
+```
+
+</Accordion>
+
+Open a streaming writer for a file. Use this for files too large to hold in memory; pair with `await using` so the [`FsWriteSink`](#fswritesink) closes itself when the scope exits.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#fswritesink">Promise&lt;FsWriteSink&gt;</a></div>
+    <div className="msb-param-desc">Streaming writer.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">list()</span>
+
+```typescript
+list(path: string): Promise<FsEntry[]>
+```
+
+<Accordion title="Example">
+
+```typescript
+for (const entry of await fs.list("/app")) {
+  console.log(`${entry.kind}\t${entry.path}`);
+}
+```
+
+</Accordion>
+
+List the entries in a directory.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute directory path inside the guest.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#fsentry">Promise&lt;FsEntry[]&gt;</a></div>
+    <div className="msb-param-desc">Directory entries.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">mkdir()</span>
+
+```typescript
+mkdir(path: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.mkdir("/app/data");
+```
+
+</Accordion>
+
+Create a directory. Parent directories must already exist.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute directory path.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">removeDir()</span>
+
+```typescript
+removeDir(path: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.removeDir("/app/data");
+```
+
+</Accordion>
+
+Remove a directory.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute directory path.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">remove()</span>
+
+```typescript
+remove(path: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.remove("/tmp/config.json");
+```
+
+</Accordion>
+
+Remove a file.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute file path.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">stat()</span>
+
+```typescript
+stat(path: string): Promise<FsMetadata>
+```
+
+<Accordion title="Example">
+
+```typescript
+const meta = await fs.stat("/app/config.json");
+console.log(`${meta.size} bytes, mode ${meta.mode.toString(8)}`);
+```
+
+</Accordion>
+
+Get detailed metadata for a file or directory.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><a className="msb-type" href="#fsmetadata">Promise&lt;FsMetadata&gt;</a></div>
+    <div className="msb-param-desc">File metadata.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">exists()</span>
+
+```typescript
+exists(path: string): Promise<boolean>
+```
+
+<Accordion title="Example">
+
+```typescript
+if (await fs.exists("/app/config.json")) {
+  console.log("config present");
+}
+```
+
+</Accordion>
+
+Check whether a path exists inside the sandbox.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>path</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Absolute path inside the guest.</div>
+  </div>
+</div>
+
+<p className="msb-label">Returns</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><span className="msb-type">Promise&lt;boolean&gt;</span></div>
+    <div className="msb-param-desc"><code>true</code> if the path exists.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">copy()</span>
+
+```typescript
+copy(from: string, to: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.copy("/app/config.json", "/app/config.bak.json");
+```
+
+</Accordion>
+
+Copy a file within the sandbox.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>from</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Source path.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>to</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Destination path.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">rename()</span>
+
+```typescript
+rename(from: string, to: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.rename("/tmp/draft.txt", "/tmp/final.txt");
+```
+
+</Accordion>
+
+Rename or move a file or directory within the sandbox.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>from</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Current path.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>to</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">New path.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">copyFromHost()</span>
+
+```typescript
+copyFromHost(hostPath: string, guestPath: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.copyFromHost("./seed.db", "/app/data/seed.db");
+```
+
+</Accordion>
+
+Copy a file from the host machine into the sandbox. For transferring many files, consider a [bind-mounted volume](/sandboxes/volumes) instead.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>hostPath</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Path on the host filesystem.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>guestPath</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Destination path inside the sandbox.</div>
+  </div>
+</div>
+
+#### <span className="msb-recv">fs.</span><span className="msb-hn">copyToHost()</span>
+
+```typescript
+copyToHost(guestPath: string, hostPath: string): Promise<void>
+```
+
+<Accordion title="Example">
+
+```typescript
+await fs.copyToHost("/app/out/report.pdf", "./report.pdf");
+```
+
+</Accordion>
+
+Copy a file from the sandbox to the host machine.
+
+<p className="msb-label">Parameters</p>
+
+<div className="msb-params">
+  <div className="msb-param">
+    <div className="msb-param-key"><code>guestPath</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Path inside the sandbox.</div>
+  </div>
+  <div className="msb-param">
+    <div className="msb-param-key"><code>hostPath</code><span className="msb-type">string</span></div>
+    <div className="msb-param-desc">Destination path on the host.</div>
+  </div>
+</div>
+
+## FsReadStream
+
+
+<p className="msb-backref">Returned by <a href="#fs-readstream">readStream()</a></p>
+
+Async stream for reading a file in chunks. Implements `AsyncIterable<Uint8Array>` and `AsyncDisposable`, so it works with `for await...of` and `await using`.
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">recv()</span>
+
+```typescript
+recv()
+```
+
+Receive the next chunk. Returns `null` when the file has been fully read.
+
+<p className="msb-label">Returns</p>
+
+`Promise<Uint8Array \| null>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">collect()</span>
+
+```typescript
+collect()
+```
+
+Drain the stream into a single buffer
+
+<p className="msb-label">Returns</p>
+
+`Promise<Uint8Array>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">[Symbol.asyncIterator]()</span>
+
+```typescript
+[Symbol.asyncIterator]()
+```
+
+Iterate chunks with `for await...of`
+
+<p className="msb-label">Returns</p>
+
+`AsyncIterator<Uint8Array>`
+
+#### <span className="msb-recv">stream.</span><span className="msb-hn">[Symbol.asyncDispose]()</span>
+
+```typescript
+[Symbol.asyncDispose]()
+```
+
+Stop reading; runs on `await using` scope exit
+
+<p className="msb-label">Returns</p>
+
+`Promise<void>`
+
+## FsWriteSink
+
+
+<p className="msb-backref">Returned by <a href="#fs-writestream">writeStream()</a></p>
+
+Streaming writer for a file. Implements `AsyncDisposable`, so it can be paired with `await using`.
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">write()</span>
+
+```typescript
+write(data)
+```
+
+Append a chunk. Strings are encoded as UTF-8.
+
+<p className="msb-label">Returns</p>
+
+`Promise<void>`
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">close()</span>
+
+```typescript
+close()
+```
+
+Flush and close. Idempotent.
+
+<p className="msb-label">Returns</p>
+
+`Promise<void>`
+
+#### <span className="msb-recv">sink.</span><span className="msb-hn">[Symbol.asyncDispose]()</span>
+
+```typescript
+[Symbol.asyncDispose]()
+```
+
+Calls `close()` on `await using` scope exit
+
+<p className="msb-label">Returns</p>
+
+`Promise<void>`
+
+## Types
+
+### FsEntry
+
+<p className="msb-backref">Returned by <a href="#fs-list">list()</a></p>
+
+Metadata for a single directory entry.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| path | `string` | Entry path |
+| kind | [`FsEntryKind`](#fsentrykind) | Type of entry |
+| size | `number` | File size in bytes |
+| mode | `number` | Unix permission bits |
+| modified | `Date \| null` | Last modified timestamp, or `null` if unavailable |
+
+### FsMetadata
+
+<p className="msb-backref">Returned by <a href="#fs-stat">stat()</a></p>
+
+Detailed file metadata.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| kind | [`FsEntryKind`](#fsentrykind) | Type of entry |
+| size | `number` | File size in bytes |
+| mode | `number` | Unix permission bits |
+| readonly | `boolean` | Whether the file is read-only |
+| modified | `Date \| null` | Last modified timestamp, or `null` if unavailable |
+| created | `Date \| null` | Creation timestamp, or `null` if unavailable |
+
+### FsEntryKind
+
+<p className="msb-backref">Used by <a href="#fsentry">FsEntry.kind</a> · <a href="#fsmetadata">FsMetadata.kind</a></p>
+
+```typescript
+type FsEntryKind = "file" | "directory" | "symlink" | "other";
+```
+
+| Value | Description |
+|-------|-------------|
+| `"file"` | Regular file |
+| `"directory"` | Directory |
+| `"symlink"` | Symbolic link |
+| `"other"` | Other entry type |

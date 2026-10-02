@@ -1,0 +1,51 @@
+# Rust Examples
+
+## Prerequisites
+
+- [Rust](https://rustup.rs/) (2024 edition)
+- `msb` + `libkrunfw` installed (via `cargo build` with the `download-binaries` feature, or manually)
+- For `root-bind` and `root-block`: `git submodule update --init --recursive`
+
+## Running
+
+Each example is a standalone binary crate in the workspace:
+
+```sh
+cargo run -p <example-name>
+```
+
+For example:
+
+```sh
+cargo run -p oci-root
+cargo run -p net-basic
+cargo run -p fs-read-stream
+```
+
+Configuration-focused examples intentionally replace their fixed-name sandbox so reruns match the source. `shell-attach` uses `connect_or_create` instead, preserving its interactive workspace and configuration across runs.
+
+## Examples
+
+| Example | Command | Description |
+|---------|---------|-------------|
+| `lifecycle-convergence` | `cargo run -p lifecycle-convergence` | Live convergence and stale-handle identity-safety checks with timing metrics |
+| `cloud-backend` | `cargo run -p cloud-backend` | Cloud backend lifecycle and live logs |
+| `root-oci` | `cargo run -p root-oci` | OCI image rootfs |
+| `root-bind` | `cargo run -p root-bind` | Bind-mounted local directory |
+| `root-block` | `cargo run -p root-block` | qcow2 disk image |
+| `rootfs-patch` | `cargo run -p rootfs-patch` | Pre-boot filesystem patches |
+| `init-handoff` | `cargo run -p init-handoff` | Hand PID 1 off to systemd |
+| `volume-named` | `cargo run -p volume-named` | Named volumes shared across sandboxes |
+| `volume-disk` | `cargo run -p volume-disk` | Disk image volumes (raw / qcow2) at guest paths |
+| `snapshot-fork` | `cargo run -p snapshot-fork` | Snapshot a stopped sandbox and boot a fresh one from it |
+| `fs-read-stream` | `cargo run -p fs-read-stream` | Streaming file read |
+| `metrics-stream` | `cargo run -p metrics-stream` | Streaming resource metrics |
+| `shell-attach` | `cargo run -p shell-attach` | Reusable interactive shell using `connect_or_create` |
+| `net-basic` | `cargo run -p net-basic` | Basic networking |
+| `net-dns` | `cargo run -p net-dns` | DNS filtering |
+| `net-policy` | `cargo run -p net-policy` | Network policies |
+| `net-ports` | `cargo run -p net-ports` | Port publishing |
+| `net-secrets` | `cargo run -p net-secrets` | Secret injection |
+| `net-tls` | `cargo run -p net-tls` | TLS interception |
+
+The `snapshot-fork` example keeps its historical directory name; it demonstrates restoring a saved disk snapshot. Live forking uses the `fork` API.

@@ -1,0 +1,147 @@
+---
+title: Image commands
+sidebarTitle: "Images"
+description: Pull and manage OCI images from the CLI
+icon: "layer-group"
+---
+
+<Tooltip tip="Image commands manage the local cache. On microsandbox cloud, specify an OCI image when creating the sandbox and it is pulled for you."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+## msb pull
+
+Download an image to the local cache. Shared layers are stored once.
+
+```bash
+msb pull python
+msb pull alpine
+msb pull ghcr.io/my-org/my-image:v1
+msb pull python --materialize flat
+msb pull python --materialize all
+```
+
+Expanded form: `msb image pull`.
+
+| Flag | Description |
+|------|-------------|
+| `-f`, `--force` | Force re-download even if cached |
+| `-q`, `--quiet` | Suppress progress output |
+| `--insecure` | Connect over plain HTTP instead of HTTPS |
+| `--ca-certs <PATH>` | Path to a PEM file with additional CA root certificates |
+| `--materialize <MODE>` | Explicitly prepare `layered`, `flat`, or `all` rootfs artifacts |
+
+[Managed registry settings](/configuration#auth-resolution-order) take precedence over `--insecure`, `--ca-certs`, and supplied credentials. A managed TLS-only entry preserves normal credential lookup.
+
+`layered` prepares the standard root; `flat` prepares a complete ext4 base; `all` prepares both. See [flat roots](/cli/sandbox-commands#flat-oci-rootfs).
+
+Without `--materialize`, the configured `sandbox_defaults.oci.root_disk` selects the layout. The built-in default is layered.
+
+
+<Tip>
+  Pre-pulling is useful when you want sandbox creation to be instant. Without a pre-pull, the first `Sandbox.create` with a new image will block on the download.
+</Tip>
+
+## msb load
+
+Load a Docker image archive or OCI Image Layout archive into the local microsandbox cache.
+
+```bash
+docker save my-image:latest | msb load
+msb load --input my-image.tar
+msb load --input oci-layout.tar --tag my-image:latest
+```
+
+Expanded form: `msb image load`.
+
+| Flag | Description |
+|------|-------------|
+| `-i`, `--input <PATH>` | Read archive from a tar file instead of stdin |
+| `-t`, `--tag <REF>` | Add a local image reference to the first imported image |
+| `-q`, `--quiet` | Suppress output |
+
+## msb save
+
+Save one or more cached images as a Docker-compatible archive or OCI Image Layout archive.
+
+```bash
+msb save --output my-image.tar my-image:latest
+msb save --format oci --output my-image.oci.tar my-image:latest
+msb save my-image:latest > my-image.tar
+```
+
+Expanded form: `msb image save`.
+
+| Flag | Description |
+|------|-------------|
+| `--format <FORMAT>` | Archive format (`docker`, `oci`; default: `docker`) |
+| `-o`, `--output <PATH>` | Write archive to a tar file instead of stdout |
+| `-q`, `--quiet` | Suppress output |
+
+Exports preserve image contents, but regenerated layers can change image and layer digests.
+
+## msb images
+
+List images in the local cache.
+
+```bash
+msb images
+msb images --format json
+msb images -q               # References only
+```
+
+Expanded form: `msb image ls`.
+
+| Flag | Description |
+|------|-------------|
+| `--format` | Output format (`json`) |
+| `-q`, `--quiet` | Show only image references |
+
+## msb image inspect
+
+Show detailed metadata for a cached image (manifest, layers, config).
+
+```bash
+msb image inspect python
+msb image inspect python --format json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--format` | Output format (`json`) |
+
+## msb rmi
+
+Remove one or more cached images and their layers (layers shared with other images are kept).
+
+```bash
+msb rmi python
+msb rmi alpine ubuntu   # Remove multiple
+```
+
+Expanded form: `msb image rm`.
+
+| Flag | Description |
+|------|-------------|
+| `-f`, `--force` | Remove even if the image is used by existing sandboxes |
+| `-q`, `--quiet` | Suppress output |
+
+## msb image prune
+
+Remove cached images that are not used by any sandbox or indexed snapshot, then clean up dangling image artifacts.
+
+```bash
+msb image prune
+msb image prune --yes
+msb image prune --format json
+```
+
+Images referenced by sandboxes or indexed snapshots are kept. To remove a specific referenced image, use `msb rmi --force`.
+
+| Flag | Description |
+|------|-------------|
+| `-y`, `--yes` | Skip the confirmation prompt |
+| `--format` | Output format (`json`) |
+| `-q`, `--quiet` | Suppress output |
+
+## msb registry
+
+See [Registry commands](/cli/registry-commands) for login, logout, and stored credentials.

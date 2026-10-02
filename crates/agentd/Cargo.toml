@@ -1,0 +1,46 @@
+[package]
+name = "microsandbox-agentd"
+description = "Guest init process and agent daemon for microsandbox microVMs."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "agentd"
+path = "bin/main.rs"
+
+[lib]
+path = "lib/lib.rs"
+
+[dependencies]
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+ciborium.workspace = true
+libc.workspace = true
+microsandbox-protocol.workspace = true
+nix = { workspace = true, features = [
+    "fs",
+    "hostname",
+    "mount",
+    "process",
+    "signal",
+    "term",
+] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt",
+    "signal",
+    "sync",
+    "time",
+] }
+typed-path.workspace = true

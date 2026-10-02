@@ -1,0 +1,40 @@
+[package]
+name = "microsandbox-agent-client"
+description = "Transport-agnostic client for the microsandbox agent protocol."
+version.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[lib]
+path = "lib/lib.rs"
+
+[features]
+default = []
+# Generic byte-stream transport: drive the client over any
+# `AsyncRead + AsyncWrite` (e.g. a caller-owned, pre-authenticated WebSocket
+# adapted to bytes). No extra dependencies.
+stream = []
+# Unix domain socket transport. Builds on the generic byte-stream path.
+uds = ["microsandbox-protocol-client/uds", "stream", "dep:bytes", "dep:libc", "dep:memmap2", "dep:nix", "dep:tempfile"]
+# Windows named-pipe transport. Builds on the generic byte-stream path.
+named-pipe = ["stream", "microsandbox-protocol-client/named-pipe"]
+
+[dependencies]
+microsandbox-protocol-client.workspace = true
+ciborium.workspace = true
+bytes = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
+microsandbox-protocol.workspace = true
+nix = { workspace = true, features = ["socket", "uio"], optional = true }
+serde.workspace = true
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }

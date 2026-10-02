@@ -1,0 +1,228 @@
+---
+title: Overview
+description: What sandboxes are and how to configure them
+keywords: ["microVM sandboxes", "sandbox configuration", "sandbox lifecycle"]
+icon: "circle-info"
+---
+
+A sandbox is a microVM with its own Linux kernel, filesystem, and network stack. Your application or the `msb` CLI starts it as a child process on your machine or on [microsandbox cloud](/cloud/overview), then talks to the guest agent to run commands, move files, and control lifecycle.
+
+The security boundary is hardware virtualization, not Linux namespaces. That makes sandboxes a good fit for untrusted workloads: user-submitted code, AI agent actions, plugins, dependency installs, CI jobs, scrapers, and tools that should not inherit the host process's full privileges.
+
+## Create a sandbox
+
+At minimum, a sandbox needs a name and an image. Everything else has defaults: 1 vCPU, 512 MiB memory, public-only networking, and `/bin/sh` as the default shell.
+
+<CodeGroup>
+```typescript TypeScript
+await using sb = await Sandbox.builder("worker")
+    .image("python")
+    .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .create()
+    .await?;
+```
+
+```python Python
+sb = await Sandbox.create("worker", image="python")
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker", m.WithImage("python"))
+```
+
+```bash CLI
+msb create python --name worker
+```
+</CodeGroup>
+
+Sandbox names must be non-empty and no longer than 128 UTF-8 bytes.
+
+## Common configuration
+
+<Tooltip tip="max_cpus and max_memory are not carried on microsandbox cloud; set the CPU and memory you need at creation and recreate the sandbox to resize."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+<CodeGroup>
+```typescript TypeScript
+await using sb = await Sandbox.builder("worker")
+    .image("python")
+    .memory(1024)
+    .cpus(2)
+    .env("DEBUG", "true")
+    .label("user.id", "alice")
+    .volume("/tmp/scratch", (m) => m.tmpfs().size(100))
+    .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .memory(1024)
+    .cpus(2)
+    .env("DEBUG", "true")
+    .label("user.id", "alice")
+    .volume("/tmp/scratch", |v| v.tmpfs().size(100))
+    .create()
+    .await?;
+```
+
+```python Python
+sb = await Sandbox.create(
+    "worker",
+    image="python",
+    memory=1024,
+    cpus=2,
+    env={"DEBUG": "true"},
+    labels={"user.id": "alice"},
+    volumes={"/tmp/scratch": Volume.tmpfs(size_mib=100)},
+)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("python"),
+    m.WithMemory(1024),
+    m.WithCPUs(2),
+    m.WithEnv(map[string]string{"DEBUG": "true"}),
+    m.WithLabels(map[string]string{"user.id": "alice"}),
+    m.WithMounts(map[string]m.MountConfig{
+        "/tmp/scratch": m.Mount.Tmpfs(m.TmpfsOptions{SizeMiB: 100}),
+    }),
+)
+```
+
+```bash CLI
+msb create python --name worker \
+  -c 2 \
+  -m 1G \
+  -e DEBUG=true \
+  --label user.id=alice \
+  --tmpfs /tmp/scratch:100
+```
+</CodeGroup>
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `image` | required | OCI image, local rootfs path, or disk image |
+| `cpus` | `1` | Virtual CPU limit |
+| `max_cpus` | same as `cpus` | Boot-time maximum possible virtual CPUs |
+| `memory` | `512` | Guest memory limit in MiB |
+| `max_memory` | same as `memory` | Boot-time maximum hotpluggable memory in MiB |
+| `thp` | `madvise` | Guest transparent huge-page policy selected at boot |
+| `guest_clock` | `sync` | Follow host time (`sync`) or stop host clock updates after boot (`off`). Local Rust SDK and CLI only |
+| `workdir` | image default | Default working directory for commands |
+| `shell` | `/bin/sh` | Shell used by `shell()` calls |
+| `env` | empty | Environment variables |
+| `labels` | empty | Key/value metadata for metric attribution |
+| `volumes` | empty | Bind, named, tmpfs, or disk-image mounts |
+| `network` | public-only | Network policy and published ports |
+| `scripts` | empty | Named scripts mounted at `/.msb/scripts/` |
+
+`max_cpus` and `max_memory` reserve live resize headroom. They default to the
+starting `cpus` and `memory` values, so set them higher when a sandbox may need
+to grow later. See [Live Modify](/sandboxes/tuning) for the full change
+model.
+
+Labels are arbitrary `key=value` metadata attached to a sandbox. They can be set
+at create time or changed while the sandbox is running, and they also select
+sandboxes in bulk. See [Labels](/sandboxes/labels) for naming guidance, bulk
+actions, metric attribution, and OCI image labels.
+
+<Tip>
+  `cpus` and `memory` are limits, not reservations. Guest memory is allocated as the VM touches pages.
+</Tip>
+
+## Image sources
+
+Most sandboxes start from an OCI image:
+
+```bash
+msb create python --name worker
+```
+
+<Tooltip tip="Host-directory and disk-image root filesystems are local-only; microsandbox cloud supports OCI root filesystems."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+You can also use a host directory as the root filesystem:
+
+```bash
+msb create ./my-rootfs --name worker
+```
+
+Or boot from a disk image:
+
+```bash
+msb create ./alpine.qcow2 --name worker
+```
+
+OCI images use a copy-on-write overlay so sandboxes can share cached base layers. Disk images are attached as block devices, so each sandbox should use its own disk image copy unless the image format handles its own snapshotting.
+
+See [Images](/images/overview) for the full OCI and disk image model.
+
+## Naming conflicts
+
+<Tooltip tip="Replace-on-create is not available on microsandbox cloud; remove the existing sandbox first, then create the replacement."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+Creating a sandbox fails if another sandbox already has the same name. Use [`connect_or_create`](/sandboxes/lifecycle#reuse-or-create-a-named-sandbox) when you want to reuse the current persisted identity and its configuration. Use replace when you explicitly want a fresh sandbox with that name:
+
+<CodeGroup>
+```typescript TypeScript
+await using sb = await Sandbox.builder("worker")
+    .image("python")
+    .replace()
+    .create();
+```
+
+```rust Rust
+let sb = Sandbox::builder("worker")
+    .image("python")
+    .replace()
+    .create()
+    .await?;
+```
+
+```python Python
+sb = await Sandbox.create("worker", image="python", replace=True)
+```
+
+```go Go
+sb, err := m.CreateSandbox(ctx, "worker",
+    m.WithImage("python"),
+    m.WithReplace(),
+)
+```
+
+```ruby Ruby
+sb = Microsandbox::Sandbox.create("worker", image: "python", replace: true)
+```
+
+```bash CLI
+msb create --replace python --name worker
+```
+</CodeGroup>
+
+When replacing a running sandbox, microsandbox attempts graceful shutdown before force-killing it. Use `replace_with_timeout` or `--replace-with-timeout` when the workload needs a longer grace period.
+
+## Reference
+
+For the complete sandbox API, see [TypeScript](/sdk/typescript/sandbox), [Rust](/sdk/rust/sandbox), [Python](/sdk/python/sandbox), or [Go](/sdk/go/sandbox). For terminal and REST workflows, see [Sandbox commands](/cli/sandbox-commands) and the [Cloud API](/api-reference/overview).
+
+## Where to go next
+
+- [Lifecycle](/sandboxes/lifecycle): start, stop, detach, wait, and remove sandboxes
+- [Commands](/sandboxes/commands): run commands and stream output
+- [Filesystem](/sandboxes/filesystem): read, write, and transfer files
+- [Secrets](/sandboxes/secrets): inject credentials without exposing values
+- [Images](/images/overview): choose OCI, directory, or disk-image roots
+- [Volumes](/sandboxes/volumes): persist or share data
+- [SSH](/sandboxes/ssh): connect with SSH and SFTP clients
+- [Snapshots](/sandboxes/snapshots): capture and reuse writable sandbox state
+- [Live Modify](/sandboxes/tuning): change settings after create
+- [Labels](/sandboxes/labels): organize, select, and attribute sandboxes
+- [Logs](/sandboxes/logs): inspect workload and runtime output
+- [Metrics](/sandboxes/metrics): monitor sandbox resource usage
+- [Bootstrap](/sandboxes/bootstrap): prepare scripts, patches, and PID 1
+- [Networking](/networking/overview): control egress, ingress, DNS, and ports

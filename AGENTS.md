@@ -1,0 +1,379 @@
+# AGENTS.md
+
+These instructions are only for agents contributing changes to this repository.
+Do not apply them to other repositories or to general agent behavior outside this contribution workflow.
+
+## Scope
+
+- Follow these guidelines when editing code, docs, tests, examples, CI, or release files for microsandbox.
+- Prefer repository conventions over generic agent habits. When unsure, inspect nearby files and match their style.
+- Do not create branches, commit, push, tag, publish, or open pull requests unless the human explicitly asks.
+- Check `git status --short --branch` before making changes. Do not overwrite or revert user work unless explicitly asked.
+
+## Project Map
+
+- `sdk/rust` is the public Rust SDK crate.
+- `crates/cli` contains the `msb` CLI.
+- `crates/runtime` contains VM runtime integration.
+- `crates/filesystem`, `crates/image`, `crates/network`, `crates/db`, `crates/migration`, `crates/metrics`, `crates/metrics-collector`, `crates/protocol`, and `crates/utils` are shared internal crates.
+- `packages/agent-client` and `packages/microsandbox-types` are the shared agent-protocol client and wire-contract type packages, each with Rust and TypeScript implementations.
+- `crates/agentd` is the in-guest agent. It is a workspace member; the musl guest binary that ships in releases is built separately.
+- `sdk/python`, `sdk/node-ts`, and `sdk/go` contain the language SDKs and native bindings.
+- `docs/` contains the documentation site. Keep docs in sync with user-facing behavior.
+- `examples/` contains runnable examples. Add new example projects only when requested or clearly required by the contribution.
+- `mcp/` and `skills/` are submodules related to agent integrations.
+- `vendor/libkrunfw` is a submodule for the kernel firmware library.
+
+Repository layout:
+
+```text
+.
+|-- AGENTS.md
+|-- Cargo.lock
+|-- Cargo.toml
+|-- COMPATIBILITY.md
+|-- DEVELOPMENT.md
+|-- Dockerfile.agentd
+|-- justfile
+|-- msb-entitlements.plist
+|-- assets/
+|-- crates/
+|   |-- agentd/
+|   |-- cli/
+|   |-- db/
+|   |-- filesystem/
+|   |-- image/
+|   |-- metrics/
+|   |-- metrics-collector/
+|   |-- migration/
+|   |-- network/
+|   |-- protocol/
+|   |-- runtime/
+|   |-- testing/
+|   |   |-- init/
+|   |   |-- macros/
+|   |   `-- utils/
+|   `-- utils/
+|-- docs/
+|   |-- changelog/
+|   |-- cli/
+|   |-- getting-started/
+|   |-- images/
+|   |-- networking/
+|   |-- observability/
+|   |-- recipes/
+|   |-- sandboxes/
+|   |-- sdk/
+|   `-- security/
+|-- examples/
+|   |-- python/
+|   |-- rust/
+|   `-- typescript/
+|-- mcp/
+|   |-- bin/
+|   |-- src/
+|   `-- package.json
+|-- packages/
+|   |-- agent-client/
+|   `-- microsandbox-types/
+|-- packaging/
+|   `-- docker/
+|-- scripts/
+|   `-- smoke/
+|-- sdk/
+|   |-- go/
+|   |-- node-ts/
+|   |-- rust/
+|   `-- python/
+|-- skills/
+|   `-- microsandbox/
+`-- vendor/
+    `-- libkrunfw/
+```
+
+## Design Principles
+
+- Before making or continuing a change that may introduce a regression, breaking change, or backward-compatibility risk identified below, stop and alert the human with the likely impact and affected workflows.
+- Keep changes narrowly scoped to the requested behavior. Avoid drive-by refactors, unrelated formatting, or dependency churn.
+- Treat sandbox isolation, host filesystem access, networking, and secret handling as security-sensitive. Validate inputs at boundaries and avoid exposing host paths, credentials, or ambient privileges.
+- For public APIs, keep the Rust SDK, CLI, Python SDK, Node SDK, Go SDK, docs, and examples consistent when they describe the same capability.
+- Prefer explicit errors with useful context over silent fallbacks.
+
+## Host Path Handling
+
+- For every path input, identify whether it belongs to the local host, a remote backend, or the guest before resolving it. Never resolve cloud or guest paths against the SDK client's working directory.
+- Resolve local host paths against their documented base once, before deferred use or persistence. Retained handles and asynchronous operations must reuse that resolved path, including their final writes. Sandbox and SDK configuration-file inputs use the contributing file's directory, including managed SDK settings.
+- Making a path absolute must preserve its symlink policy. Do not substitute filesystem canonicalization or collapse parent components across symlinks without reviewing the behavior change.
+- Preserve existing persisted relative paths and their legacy startup/resource-inheritance behavior. They have no reliable original base unless it was saved: do not reject, migrate, prompt about, or rewrite them during restart. Capture absolute host inputs only for new sandboxes, including new restore/branch children, without modifying their source sandbox.
+- Path changes need regression coverage with different creation and consumption directories, plus missing targets and symlinks where applicable. Change process cwd only inside an isolated test subprocess. Review sandbox mounts, rootfs paths, TLS files, backend storage roots, snapshots, transfers, and generated commands when adding a new path input.
+
+## Backward Compatibility Review
+
+Backward-compatibility detection is a required part of working on this project. Surface potential compatibility breaks before making or continuing the affected change.
+
+The review's immediate goal is proactive detection and reporting, not automatically implementing compatibility fixes. Do not silently add compatibility layers, migrations, legacy codecs, fallback paths, or downgrade behavior. When a material risk is found, explain the affected releases, components, persisted artifacts, users or workflows, the likely failure mode, and the available options; then wait for human direction as required by the Design Principles above.
+
+SDK-to-`msb` compatibility is required in both directions for future changes:
+
+- Newer SDKs must continue to work with older `msb` binaries for existing supported workflows.
+- Newer `msb` binaries must continue to work with older SDKs for existing supported workflows.
+- Apply this requirement to every language SDK and the complete SDK/runtime interaction, including binary resolution, launch arguments and JSON, inherited descriptors, startup responses, control and agent protocols, and shared persisted state. Compatibility with an already-running agent alone does not establish launch compatibility.
+- A new feature unavailable in an older peer must be detected and produce a clear unsupported-feature or upgrade-required error, or use an explicitly approved fallback. It must not silently lose requested behavior or break unrelated existing functionality.
+- Do not assume matching package versions or bundled binaries satisfy this requirement. Review independently installed runtimes, including those resolved from `MSB_HOME`, and use cross-version tests or historical fixtures for affected boundaries; same-version tests alone are insufficient evidence.
+
+Bidirectional SDK/runtime compatibility does not mean freezing the shared catalog at the oldest installed or running version. Newer SDKs and CLIs may apply validated catalog upgrades while older VM runtimes remain running. Do not add a blanket "stop all sandboxes before upgrading" gate or preserve an old catalog solely because an older runtime is present. Distinguish an older VM process continuing its database writes from an older SDK/CLI reopening the catalog and running its own schema-admission checks; test and report these separately rather than treating one as evidence for the other.
+
+For online catalog upgrades, preserve migration serialization, transaction safety, recovery journals, and active maintenance leases. Evaluate the actual SQL and persisted-data contracts used by older runtimes; neither an additive-looking migration nor a version difference alone proves safety or incompatibility. Live tests must exercise an older VM across the upgrade, verify retained execution and data, and cover new-SDK launch, control, restart, and cleanup through older runtimes. If a concrete incompatible migration is found, report that specific conflict for a decision rather than reintroducing a blanket compatibility blocker.
+
+If a proposed change may violate either direction, flag it before implementation and wait for human direction; this requirement does not authorize silently building adapters or choosing a breaking change. Any exception or change to the supported compatibility horizon requires explicit human direction. The known v0.6.9 ↔ v0.6.10 launch incompatibility is an accepted historical exception and must not be repaired as part of unrelated work. It does not exempt future changes from this review or requirement.
+
+By explicit user direction on 2026-09-13, the historical SDK/runtime compatibility target for this work is v0.6.x, with v0.6.0 as the floor, against the current implementation candidate in both directions. Releases older than v0.6.0, including all v0.4.x and v0.5.x releases, are excluded from required compatibility. Preserve their historical results as diagnostic evidence. This supersedes the earlier exact-v0.5.0 exclusion. Existing codecs and capability gates are not removed or changed by this scope decision. The known v0.6.9 ↔ v0.6.10 exception remains unchanged; other v0.6.x failures are not waived.
+
+Before changing an existing cross-version boundary, determine:
+
+- What older component, binary, sandbox, or persisted state may interact with the change.
+- Which side is the old producer or consumer.
+- Whether failure would be a clean refusal, loss of functionality, stranded state, silent misinterpretation, data loss, or possible corruption.
+- Whether the repository has a fixture or test using an actual older artifact or binary, rather than only same-version round trips.
+
+Always perform this review when a change affects any of these areas:
+
+- Host-to-guest framing, message names, flags, IDs, payload fields, version negotiation, bootstrap, or lifecycle handshakes.
+- Unix sockets, Windows named pipes, path hashing, relay routing, control messages, inherited file descriptors, signals, or process-launch JSON.
+- SQLite schemas, migration history, persisted configuration, downgrade behavior, journals, leases, or runtime recovery state.
+- ext4, EROFS, VMDK, OCI layers, filesystem metadata, device IDs, mount tags, block paths, or other on-disk formats.
+- Snapshots, archives, manifests, canonical serialization, digests, parent identities, filenames, or atomic publication order.
+- Cache keys, materializer ABIs, layer ordering, whiteouts, hardlinks, xattrs, or content-addressed storage.
+- The runtime, agentd, libkrun, firmware, kernel patches, virtio devices, shared-memory layouts, or package-version coupling.
+- Network address derivation, MACs, interface names, DNS aliases, published ports, TCP/UDP behavior, vsock, SSH, or SFTP behavior.
+- Heartbeats, boot errors, metrics, logs, lock files, runtime directories, or other files consumed across process or release boundaries.
+
+Check each applicable compatibility direction:
+
+1. A new host interacting with an old running sandbox and old agentd.
+2. A new release opening an existing `MSB_HOME` and its database.
+3. A new release reading old disks, snapshots, archives, caches, and filesystem metadata.
+4. An older release encountering state written by the new release, including downgrade refusal behavior.
+5. Exported artifacts moving between releases, platforms, or architectures.
+6. Independently running components from different releases communicating during an upgrade.
+7. A newer SDK launching and operating an older `msb` binary.
+8. An older SDK launching and operating a newer `msb` binary.
+
+Treat stable strings, numeric constants, paths, hashes, serialized field details, ordering guarantees, timing, and error interpretations as compatibility-sensitive even when they are not part of the public API.
+
+For changes affecting persisted data or cross-version communication, read [COMPATIBILITY.md](COMPATIBILITY.md) before implementation. Follow its contract-version naming, module ownership, migration, and validation guidelines.
+
+## Path Handling
+
+- Every relative path must have an explicit base directory. Never rely on the working directory at the time of eventual use.
+- Resolve CLI paths against the invocation directory, config-file paths against the config file’s directory, and SDK paths against a documented base.
+- Capture that base and resolve host paths before spawning asynchronous work or passing them to another process.
+- Persist absolute host paths when they reference a fixed local resource that must remain the same across restarts.
+- Distinguish host paths, guest paths, volume-relative paths, and resource identifiers. Do not apply host-path normalization to all strings.
+- Making a path absolute, collapsing `..`, and resolving symlinks are different operations. Choose deliberately; they can select different destinations.
+- Use structured path fields internally. Avoid concatenating paths into delimiter-separated strings that become ambiguous with valid filenames.
+- Return explicit errors when resolution fails. Never silently substitute another directory or panic.
+- Enforce filesystem containment during the operation, accounting for symlinks and concurrent changes. String-prefix checks alone are insufficient.
+- Centralize path-resolution rules so CLI, SDK, and background execution cannot drift.
+
+For path-related changes, test creation in directory A followed by use from directory B, plus relevant symlink, `..`, missing-path, and platform-specific cases. Assert the exact file or directory accessed—not just whether the operation succeeded.
+
+## Rust Layout And Style
+
+- Most Rust crates use `lib/lib.rs` for library code and `bin/main.rs` for binaries. Keep using those paths for new crate entries unless the surrounding crate already does something different.
+- When adding a new library or binary target, declare the path explicitly in `Cargo.toml`:
+
+```toml
+[lib]
+path = "lib/lib.rs"
+
+[[bin]]
+name = "example"
+path = "bin/main.rs"
+```
+
+- Keep crate roots and module roots thin. `lib.rs` and `mod.rs` should declare modules, crate attributes, and exports only. Put implementation in leaf modules such as `sandbox/config.rs`, `policy/types.rs`, or `commands/run.rs`.
+- File order should be:
+  1. Module docs and crate/file attributes, such as `//! ...` and `#![warn(missing_docs)]`.
+  2. `use` imports.
+  3. Sectioned items.
+- Group imports by origin, separated by blank lines: standard library first, external crates second, then `crate::` and `super::` imports.
+- Do not put `use` statements inside sections unless there is a narrow local reason, such as a test module import.
+- Use the exact section delimiter shown below. Do not invent alternate Markdown-style, shorter, or decorative section headers.
+- Include only sections that contain items. Do not add empty sections just to satisfy the full order.
+- Organize Rust files with these section headers, in this order when applicable:
+
+```rust
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Trait Implementations
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Macros
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+```
+
+- Aggregator files that only expose modules and public items may use `Exports` instead of `Re-Exports` when matching existing files.
+- Use qualified section labels only to split large sections into obvious groups, for example `Types: Identifiers`, `Functions: Handlers`, or `Functions: Helpers`.
+- Do not create a qualified section for one or two items unless the surrounding file already uses that pattern.
+- Put constants and statics under `Constants`.
+- Put `struct`, `enum`, `trait`, and `type` definitions under `Types`.
+- Put inherent `impl Type` blocks under `Methods`, directly after the related type definitions when practical.
+- Put `impl Trait for Type` blocks under `Trait Implementations`.
+- Put free functions under `Functions`. If a free function is only used by one public function, place it later in `Functions: Helpers`.
+- Put macros under `Macros`, not near the call site.
+- Put unit tests under `Tests`, usually as `#[cfg(test)] mod tests`. Keep test-only helpers in the same section.
+- Put public re-exports under `Re-Exports`, or `Exports` in root files that use the existing aggregator style.
+- Keep items in dependency order inside a section: public surface first, private helpers later.
+- Keep docs on public types, fields, methods, functions, and modules. This repo uses `#![warn(missing_docs)]` in public crates, so new public items should explain what they are for.
+- Prefer explicit domain types over loosely typed strings, booleans, or tuples when the value crosses an API or subsystem boundary.
+- During refactors, conflict resolution, bug fixes, and feature work, call out any expected behavior, API, or data-format changes and wait for direction when the risk is material.
+- Use `thiserror` or existing local error patterns for typed errors. Include enough context for callers to understand the failing operation.
+- In async code, avoid holding locks across `.await`. Prefer explicit ownership, short critical sections, and existing Tokio patterns in the surrounding module.
+- Keep feature-gated code close to the feature it gates and use existing `#[cfg(feature = "...")]` patterns.
+- Do not add examples under `examples/` unless requested or clearly required. Prefer tests and docs for small usage coverage.
+- Run `cargo fmt` before finalizing Rust changes.
+
+## Development Build Notes
+
+- If you build `msb` to run it locally on macOS, make sure the binary is codesigned with `msb-entitlements.plist`; otherwise VM/runtime failures may be caused by missing entitlements instead of your code change.
+- Prefer `just build` or `just build-msb` when producing a runnable local binary. The macOS recipe rebuilds `msb` and runs:
+
+```bash
+codesign --entitlements msb-entitlements.plist --force -s - build/msb
+```
+
+- If you bypass `just` and call `cargo build` directly, manually codesign the exact `msb` binary you are going to run before testing sandbox startup, protocol, networking, or filesystem behavior.
+
+## Validation
+
+Use focused checks for the files you touched, then broader checks when the change crosses crate, SDK, CLI, or runtime boundaries.
+
+Common Rust checks:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace -- -D warnings
+cargo test --workspace
+cargo build -p microsandbox-cli
+```
+
+`agentd` is a workspace member, so the workspace-wide commands above cover it. The musl guest binary that ships in releases is built separately via `just build-agentd`.
+
+Python SDK checks:
+
+```bash
+cd sdk/python
+uv sync --group dev
+uv run maturin develop --release
+uv run pytest
+uv run ruff check .
+```
+
+Node SDK checks:
+
+```bash
+cd sdk/node-ts
+npm ci
+npm run build
+npm test
+npm run typecheck
+```
+
+Go SDK checks:
+
+```bash
+cd sdk/go
+go test -count=1 .
+go test -tags "smoke microsandbox_ffi_path" -count=1 -timeout 2m .
+```
+
+Integration tests may require Linux with KVM or macOS Apple Silicon support. If a needed check cannot run in the current environment, say exactly which command was skipped and why.
+
+The full local setup and build loop is documented in `DEVELOPMENT.md`. Use `just setup`, `just build`, and `just install` when you need the full local runtime, `agentd`, or `libkrunfw` artifacts.
+
+## Commits
+
+- Use Conventional Commits for commit titles: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`, `perf`, `ci`, or `build`.
+- Use a scope when it clarifies the affected area, for example `fix(network): ...` or `docs(sdk): ...`.
+- Keep the subject imperative, lowercase after the colon, no trailing period, and at most 72 characters.
+- Include a commit body for non-trivial changes. Explain what changed and why.
+- Use signed commits: `git commit -S`.
+- Before committing, inspect the actual diff, including new, modified, and deleted files. Do not write a commit message from filenames or previous commit messages alone.
+- If there is nothing to commit, say so rather than creating an empty commit.
+
+Example:
+
+```text
+fix(network): wake smoltcp after accepted host connections
+
+Notify the network loop after accepting a published-port connection so
+pending guest traffic can make progress without waiting for another timer.
+```
+
+## Branches And Pull Requests
+
+- You may make local edits while on `main`, but do not commit directly to `main`. Start from the latest `main` when creating a contribution branch.
+- Use short, descriptive, kebab-case branch names. Avoid personal prefixes in shared documentation unless the maintainer asks for one.
+- Before opening a PR, compare against the intended base branch and inspect the actual diff:
+
+```bash
+git log origin/main..HEAD --oneline
+git diff origin/main..HEAD --stat
+git diff origin/main..HEAD --name-status
+```
+
+- PR titles should follow Conventional Commit style and stay under 72 characters.
+- PR descriptions should be plain and accurate:
+  - `## TL;DR`: one or two short sentences.
+  - `## Description`: a flat bullet list of core changes.
+  - `## Test Plan`: concrete commands or observable checks.
+- Do not use emojis in PR titles or descriptions.
+- If a PR description includes an API example, verify every symbol, path, flag, type, field, and signature against the diff before writing it.
+
+## Version And Release Changes
+
+- Do not bump versions, publish packages, create release tags, or modify release automation unless explicitly asked.
+- All released packages share a version. When a version bump is requested, check `Cargo.toml`, `sdk/node-ts/package.json`, `mcp/package.json`, and any other package metadata touched by the release process in `DEVELOPMENT.md`.
+- For release or version PRs, summarize the user-visible changes since the previous version bump and run the relevant dry-run publish checks when practical.
+
+## Documentation And Examples
+
+- Update docs when behavior, configuration, CLI flags, SDK APIs, or examples change.
+- Keep examples realistic and runnable. Do not invent APIs or flags.
+- Prefer editing existing examples over adding new example projects unless the new example is requested or clearly fills a missing user workflow.
+- Documentation should describe current behavior, not future plans, unless the page is explicitly about roadmap work.
+
+## Agent Operating Rules
+
+- Use `rg` or `rg --files` for repository searches.
+- Read the relevant files before editing. Let existing module boundaries guide the change.
+- Make the smallest coherent change that satisfies the request.
+- Avoid destructive git commands such as `git reset --hard` and `git checkout --` unless explicitly requested.
+- Do not edit generated artifacts, lockfiles, or submodule pointers unless the change requires it.
+- If generated files or lockfiles must change, explain why in the final summary.
+- Report what changed, what validation ran, and any checks that were skipped.

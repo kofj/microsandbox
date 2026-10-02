@@ -1,0 +1,1963 @@
+//! Guest-side filesystem operation handlers.
+//!
+//! Handles `core.fs.*` protocol messages by performing filesystem operations
+//! using `std::fs` and `tokio::fs`, then sending responses back to the host.
+
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::io::IoSlice;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+use std::sync::Arc;
+
+use bytes::Bytes;
+use microsandbox_protocol::bulk::{
+    BULK_FLOW_MASK_GUEST_TO_HOST, BULK_FLOW_MASK_HOST_TO_GUEST, BULK_PROTOCOL_VERSION,
+    BulkAccepted, BulkCredit, BulkFinish, BulkFlow, BulkKind, BulkOffer, BulkReceiveState,
+    BulkRecord, BulkSendState, DEFAULT_BULK_WINDOW, DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD,
+};
+use microsandbox_protocol::codec;
+use microsandbox_protocol::fs::{
+    FS_CHUNK_SIZE, FsData, FsEntryInfo, FsOp, FsOpenOptions, FsRequest, FsResponse, FsResponseData,
+    FsSetAttrs,
+};
+use microsandbox_protocol::message::{Message, MessageType};
+use microsandbox_protocol::transport::relay_client_slot;
+use serde::Serialize;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::{Mutex, watch};
+use tokio::task::JoinHandle;
+
+use crate::session::{
+    BulkSessionOutput, RawActivity, RawSessionCompletion, RawSessionOutput, SessionOutput,
+    SessionOutputSender,
+};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+/// Default maximum number of entries returned by one `ReadDir` request.
+const DEFAULT_READ_DIR_LIMIT: u32 = 128;
+
+/// Maximum number of open filesystem handles owned by one relay client.
+const MAX_OPEN_HANDLES_PER_OWNER: usize = 1024;
+
+//--------------------------------------------------------------------------------------------------
+// Types
+//--------------------------------------------------------------------------------------------------
+
+/// Mutable filesystem protocol state held by agentd.
+#[derive(Default)]
+pub struct FsState {
+    next_handle: u64,
+    handles: HashMap<u64, FsHandleEntry>,
+}
+
+/// Tracks an in-progress streaming write operation.
+pub struct FsWriteSession {
+    owner_id: u32,
+    handle: u64,
+    file: Arc<Mutex<tokio::fs::File>>,
+    offset: u64,
+    append: bool,
+    expected_len: Option<u64>,
+    written: u64,
+    bulk: Option<BulkReceiveState>,
+}
+
+/// Tracks an in-progress streaming read operation.
+pub struct FsReadSession {
+    owner_id: u32,
+    handle: u64,
+    task: JoinHandle<()>,
+    credit_tx: Option<watch::Sender<Option<BulkCredit>>>,
+}
+
+/// A filesystem stream session started by a request.
+pub enum FsStreamSession {
+    /// Read stream task.
+    Read(FsReadSession),
+
+    /// Write stream awaiting `FsData` chunks.
+    Write(FsWriteSession),
+}
+
+enum FsHandleEntry {
+    File {
+        owner_id: u32,
+        file: Arc<Mutex<tokio::fs::File>>,
+        read: bool,
+        write: bool,
+        append: bool,
+        path: String,
+    },
+    Dir {
+        owner_id: u32,
+        dir: Arc<Mutex<tokio::fs::ReadDir>>,
+        path: String,
+    },
+}
+
+//--------------------------------------------------------------------------------------------------
+// Methods
+//--------------------------------------------------------------------------------------------------
+
+impl FsState {
+    /// Close handles opened by a disconnected relay client.
+    pub fn close_owner_range(&mut self, id_start: u32, id_end_exclusive: u32) {
+        self.handles.retain(|_, handle| {
+            let owner_id = handle.owner_id();
+            owner_id < id_start || owner_id >= id_end_exclusive
+        });
+    }
+
+    /// Close all handles.
+    pub fn clear(&mut self) {
+        self.handles.clear();
+    }
+
+    fn insert_file(
+        &mut self,
+        owner_id: u32,
+        file: tokio::fs::File,
+        read: bool,
+        write: bool,
+        append: bool,
+        path: String,
+    ) -> Result<u64, String> {
+        self.enforce_owner_limit(owner_id)?;
+        let handle = self.alloc_handle();
+        self.handles.insert(
+            handle,
+            FsHandleEntry::File {
+                owner_id,
+                file: Arc::new(Mutex::new(file)),
+                read,
+                write,
+                append,
+                path,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn insert_dir(
+        &mut self,
+        owner_id: u32,
+        dir: tokio::fs::ReadDir,
+        path: String,
+    ) -> Result<u64, String> {
+        self.enforce_owner_limit(owner_id)?;
+        let handle = self.alloc_handle();
+        self.handles.insert(
+            handle,
+            FsHandleEntry::Dir {
+                owner_id,
+                dir: Arc::new(Mutex::new(dir)),
+                path,
+            },
+        );
+        Ok(handle)
+    }
+
+    fn close_handle(&mut self, caller_id: u32, handle: u64) -> Result<FsHandleEntry, String> {
+        if let Some(entry) = self.handles.get(&handle) {
+            entry.ensure_owner(handle, caller_id)?;
+        }
+        self.handles
+            .remove(&handle)
+            .ok_or_else(|| format!("invalid handle: {handle}"))
+    }
+
+    fn file(
+        &self,
+        caller_id: u32,
+        handle: u64,
+        need_read: bool,
+        need_write: bool,
+    ) -> Result<(Arc<Mutex<tokio::fs::File>>, bool, String), String> {
+        match self.handles.get(&handle) {
+            Some(FsHandleEntry::File {
+                file,
+                read,
+                write,
+                append,
+                path,
+                ..
+            }) => {
+                self.handles
+                    .get(&handle)
+                    .expect("entry just matched")
+                    .ensure_owner(handle, caller_id)?;
+                if need_read && !read {
+                    return Err(format!("handle {handle} is not open for reading"));
+                }
+                if need_write && !write && !append {
+                    return Err(format!("handle {handle} is not open for writing"));
+                }
+                Ok((Arc::clone(file), *append, path.clone()))
+            }
+            Some(FsHandleEntry::Dir { .. }) => Err(format!("handle {handle} is a directory")),
+            None => Err(format!("invalid handle: {handle}")),
+        }
+    }
+
+    fn dir(
+        &self,
+        caller_id: u32,
+        handle: u64,
+    ) -> Result<(Arc<Mutex<tokio::fs::ReadDir>>, String), String> {
+        match self.handles.get(&handle) {
+            Some(FsHandleEntry::Dir { dir, path, .. }) => {
+                self.handles
+                    .get(&handle)
+                    .expect("entry just matched")
+                    .ensure_owner(handle, caller_id)?;
+                Ok((Arc::clone(dir), path.clone()))
+            }
+            Some(FsHandleEntry::File { .. }) => Err(format!("handle {handle} is a file")),
+            None => Err(format!("invalid handle: {handle}")),
+        }
+    }
+
+    fn alloc_handle(&mut self) -> u64 {
+        self.next_handle = self.next_handle.wrapping_add(1).max(1);
+        while self.handles.contains_key(&self.next_handle) {
+            self.next_handle = self.next_handle.wrapping_add(1).max(1);
+        }
+        self.next_handle
+    }
+
+    fn enforce_owner_limit(&self, owner_id: u32) -> Result<(), String> {
+        let count = self
+            .handles
+            .values()
+            .filter(|entry| same_relay_client(entry.owner_id(), owner_id))
+            .count();
+        if count >= MAX_OPEN_HANDLES_PER_OWNER {
+            return Err(format!(
+                "too many open filesystem handles for relay client: {count}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl FsHandleEntry {
+    fn owner_id(&self) -> u32 {
+        match self {
+            Self::File { owner_id, .. } | Self::Dir { owner_id, .. } => *owner_id,
+        }
+    }
+
+    fn ensure_owner(&self, handle: u64, caller_id: u32) -> Result<(), String> {
+        if same_relay_client(self.owner_id(), caller_id) {
+            Ok(())
+        } else {
+            Err(format!(
+                "handle {handle} is owned by a different relay client"
+            ))
+        }
+    }
+}
+
+impl FsReadSession {
+    /// Correlation ID whose relay client owns this read stream.
+    pub fn owner_id(&self) -> u32 {
+        self.owner_id
+    }
+
+    /// Filesystem handle being read.
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// Abort the background read task.
+    pub fn abort(self) {
+        self.task.abort();
+    }
+
+    /// Delivers the latest absolute credit update to a generation-8 read task.
+    pub fn apply_credit(&self, credit: BulkCredit) -> Result<(), String> {
+        let Some(tx) = &self.credit_tx else {
+            return Err("filesystem read session is not using raw bulk".into());
+        };
+        if credit.kind != BulkKind::Filesystem || credit.flow != BulkFlow::GuestToHost {
+            return Err("filesystem read received credit for another kind or flow".into());
+        }
+        tx.send_replace(Some(credit));
+        Ok(())
+    }
+
+    /// Whether this read session negotiated generation-8 raw bulk.
+    pub fn is_bulk(&self) -> bool {
+        self.credit_tx.is_some()
+    }
+}
+
+impl FsWriteSession {
+    /// Correlation ID whose relay client owns this write stream.
+    pub fn owner_id(&self) -> u32 {
+        self.owner_id
+    }
+
+    /// Filesystem handle being written.
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// Whether this write session negotiated generation-8 raw bulk.
+    pub fn is_bulk(&self) -> bool {
+        self.bulk.is_some()
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+fn same_relay_client(left: u32, right: u32) -> bool {
+    relay_client_slot(left).is_some_and(|left| Some(left) == relay_client_slot(right))
+}
+
+/// Handles an incoming `FsRequest` message.
+pub async fn handle_fs_request(
+    id: u32,
+    protocol_version: u8,
+    req: FsRequest,
+    state: &mut FsState,
+    out_buf: &mut Vec<u8>,
+    session_tx: &SessionOutputSender,
+) -> Result<Option<FsStreamSession>, String> {
+    let FsRequest { op, bulk } = req;
+    if bulk.is_some() && protocol_version < BULK_PROTOCOL_VERSION {
+        encode_response(
+            id,
+            error_response(format!(
+                "raw bulk offer requires protocol generation {BULK_PROTOCOL_VERSION}"
+            )),
+            out_buf,
+        )?;
+        return Ok(None);
+    }
+    if bulk.is_some() && !matches!(&op, FsOp::Read { .. } | FsOp::Write { .. }) {
+        encode_response(
+            id,
+            error_response("raw bulk is only valid for streaming reads and writes".into()),
+            out_buf,
+        )?;
+        return Ok(None);
+    }
+
+    match op {
+        FsOp::RealPath { path } => {
+            let resp = handle_realpath(&path).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Stat {
+            path,
+            follow_symlink,
+        } => {
+            let resp = handle_stat(&path, follow_symlink).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::SetStat {
+            path,
+            follow_symlink,
+            attrs,
+        } => {
+            let resp = handle_setstat(&path, follow_symlink, attrs).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::List { path } => {
+            let resp = handle_list(&path).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::ReadLink { path } => {
+            let resp = handle_readlink(&path).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Symlink {
+            target,
+            link_path,
+            user,
+        } => {
+            let resp = handle_symlink(&target, &link_path, user).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Mkdir { path, mode, user } => {
+            let resp = handle_mkdir(&path, mode, user).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Remove { path } => {
+            let resp = handle_remove(&path).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::RemoveDir { path, recursive } => {
+            let resp = handle_remove_dir(&path, recursive).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Copy { src, dst } => {
+            let resp = handle_copy(&src, &dst).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Rename { src, dst } => {
+            let resp = handle_rename(&src, &dst).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::OpenFile { path, options } => {
+            let resp = handle_open_file(id, state, &path, options).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::OpenDir { path } => {
+            let resp = handle_open_dir(id, state, &path).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::CloseHandle { handle } => {
+            let resp = handle_close_handle(id, state, handle).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::Read {
+            handle,
+            offset,
+            len,
+        } => match state.file(id, handle, true, false) {
+            Ok((file, _, _)) => {
+                let tx = session_tx.clone();
+                let (task, credit_tx) = match bulk {
+                    Some(offer) => {
+                        let accepted = accept_fs_read_offer(offer)?;
+                        encode_control(MessageType::BulkAccepted, id, &accepted, out_buf)?;
+                        let sender = BulkSendState::new(
+                            BulkKind::Filesystem,
+                            BulkFlow::GuestToHost,
+                            accepted.max_record_payload,
+                            accepted.guest_to_host_credit_limit,
+                        )
+                        .map_err(|error| format!("accept read bulk state: {error}"))?;
+                        let (credit_tx, credit_rx) = watch::channel(None);
+                        let task = tokio::spawn(async move {
+                            handle_bulk_read_stream(id, file, offset, len, sender, credit_rx, &tx)
+                                .await;
+                        });
+                        (task, Some(credit_tx))
+                    }
+                    None => {
+                        let task = tokio::spawn(async move {
+                            handle_read_stream(id, file, offset, len, &tx).await;
+                        });
+                        (task, None)
+                    }
+                };
+                Ok(Some(FsStreamSession::Read(FsReadSession {
+                    owner_id: id,
+                    handle,
+                    task,
+                    credit_tx,
+                })))
+            }
+            Err(e) => {
+                encode_response(id, error_response(format!("read: {e}")), out_buf)?;
+                Ok(None)
+            }
+        },
+        FsOp::Write {
+            handle,
+            offset,
+            len,
+        } => match state.file(id, handle, false, true) {
+            Ok((file, append, _)) => {
+                let bulk = match bulk {
+                    Some(offer) => {
+                        let accepted = accept_fs_write_offer(offer)?;
+                        encode_control(MessageType::BulkAccepted, id, &accepted, out_buf)?;
+                        Some(
+                            BulkReceiveState::new(
+                                BulkKind::Filesystem,
+                                BulkFlow::HostToGuest,
+                                accepted.max_record_payload,
+                                accepted.host_to_guest_credit_limit,
+                                DEFAULT_BULK_WINDOW,
+                            )
+                            .map_err(|error| format!("accept write bulk state: {error}"))?,
+                        )
+                    }
+                    None => None,
+                };
+                Ok(Some(FsStreamSession::Write(FsWriteSession {
+                    owner_id: id,
+                    handle,
+                    file,
+                    offset,
+                    append,
+                    expected_len: len,
+                    written: 0,
+                    bulk,
+                })))
+            }
+            Err(e) => {
+                encode_response(id, error_response(format!("write: {e}")), out_buf)?;
+                Ok(None)
+            }
+        },
+        FsOp::ReadDir { handle, limit } => {
+            let resp = handle_read_dir(id, state, handle, limit).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::FStat { handle } => {
+            let resp = handle_fstat(id, state, handle).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+        FsOp::FSetStat { handle, attrs } => {
+            let resp = handle_fsetstat(id, state, handle, attrs).await;
+            encode_response(id, resp, out_buf)?;
+            Ok(None)
+        }
+    }
+}
+
+/// Handles an incoming `FsData` message for a streaming write session.
+///
+/// If `data` is empty, the file is flushed and a terminal `FsResponse` is sent.
+/// Returns `true` if the session should be removed (EOF received).
+pub async fn handle_fs_data(
+    id: u32,
+    data: FsData,
+    session: &mut FsWriteSession,
+    out_buf: &mut Vec<u8>,
+) -> Result<bool, String> {
+    if session.bulk.is_some() {
+        encode_response(
+            id,
+            error_response("CBOR filesystem data is invalid after raw bulk acceptance".into()),
+            out_buf,
+        )?;
+        return Ok(true);
+    }
+    if data.data.is_empty() {
+        if let Some(expected) = session.expected_len
+            && session.written != expected
+        {
+            let resp = error_response(format!(
+                "write length mismatch: expected {expected}, wrote {}",
+                session.written
+            ));
+            encode_response(id, resp, out_buf)?;
+            return Ok(true);
+        }
+
+        if let Some(expected) = session.expected_len {
+            let next_written = session.written.saturating_add(data.data.len() as u64);
+            if next_written > expected {
+                let resp = error_response(format!(
+                    "write length mismatch: expected {expected}, received at least {next_written}"
+                ));
+                encode_response(id, resp, out_buf)?;
+                return Ok(true);
+            }
+        }
+
+        let mut file = session.file.lock().await;
+        if let Err(e) = file.flush().await {
+            encode_response(id, error_response(format!("flush: {e}")), out_buf)?;
+            return Ok(true);
+        }
+
+        encode_response(id, ok_response(None), out_buf)?;
+        Ok(true)
+    } else {
+        let mut file = session.file.lock().await;
+        if !session.append
+            && let Err(e) = file.seek(std::io::SeekFrom::Start(session.offset)).await
+        {
+            encode_response(id, error_response(format!("seek: {e}")), out_buf)?;
+            return Ok(true);
+        }
+        if let Err(e) = file.write_all(&data.data).await {
+            encode_response(id, error_response(format!("write: {e}")), out_buf)?;
+            return Ok(true);
+        }
+        session.offset = session.offset.saturating_add(data.data.len() as u64);
+        session.written = session.written.saturating_add(data.data.len() as u64);
+        Ok(false)
+    }
+}
+
+/// Handles one generation-8 raw record for a filesystem write correlation.
+pub async fn handle_fs_bulk_record(
+    id: u32,
+    record: &BulkRecord,
+    session: &mut FsWriteSession,
+    out_buf: &mut Vec<u8>,
+) -> Result<bool, String> {
+    handle_fs_bulk_records(id, std::slice::from_ref(record), session, out_buf).await
+}
+
+/// Handles a bounded contiguous batch of generation-8 filesystem records.
+///
+/// The protocol still validates and accounts for each wire record independently. Coalescing only
+/// changes the local filesystem effect: one lock, one seek and a vectored write replace multiple
+/// blocking-file tasks when a peer negotiates records below the current filesystem default.
+pub async fn handle_fs_bulk_records(
+    id: u32,
+    records: &[BulkRecord],
+    session: &mut FsWriteSession,
+    out_buf: &mut Vec<u8>,
+) -> Result<bool, String> {
+    if records.is_empty() {
+        return Err("filesystem bulk record batch is empty".into());
+    }
+
+    let mut final_end = session.written;
+    let mut payload_bytes = 0usize;
+    {
+        let Some(receiver) = session.bulk.as_mut() else {
+            return Err("raw bulk record sent to a generation-6 filesystem write".into());
+        };
+        for record in records {
+            final_end = receiver
+                .accept_record(record)
+                .map_err(|error| format!("invalid filesystem bulk record: {error}"))?;
+            payload_bytes = payload_bytes
+                .checked_add(record.payload.len())
+                .ok_or_else(|| "filesystem bulk batch byte count overflowed usize".to_string())?;
+
+            if let Some(expected) = session.expected_len
+                && final_end > expected
+            {
+                encode_response(
+                    id,
+                    error_response(format!(
+                        "write length mismatch: expected {expected}, received at least {final_end}"
+                    )),
+                    out_buf,
+                )?;
+                return Ok(true);
+            }
+        }
+    }
+
+    let mut file = session.file.lock().await;
+    if !session.append
+        && let Err(error) = file.seek(std::io::SeekFrom::Start(session.offset)).await
+    {
+        encode_response(id, error_response(format!("seek: {error}")), out_buf)?;
+        return Ok(true);
+    }
+    if let Err(error) = write_bulk_payloads_vectored(&mut file, records).await {
+        encode_response(id, error_response(format!("write: {error}")), out_buf)?;
+        return Ok(true);
+    }
+    drop(file);
+
+    session.offset = session.offset.saturating_add(payload_bytes as u64);
+    session.written = final_end;
+    let receiver = session
+        .bulk
+        .as_mut()
+        .expect("bulk receiver was validated before the filesystem write");
+    if let Some(credit) = receiver
+        .consume(final_end)
+        .map_err(|error| format!("advance filesystem bulk credit: {error}"))?
+    {
+        encode_control(MessageType::BulkCredit, id, &credit, out_buf)?;
+    }
+    Ok(false)
+}
+
+/// Completes a vectored Tokio file write even when the kernel accepts only a prefix of the batch.
+async fn write_bulk_payloads_vectored(
+    file: &mut tokio::fs::File,
+    records: &[BulkRecord],
+) -> std::io::Result<()> {
+    if records.len() == 1 {
+        return file.write_all(&records[0].payload).await;
+    }
+
+    let mut record_index = 0usize;
+    let mut record_offset = 0usize;
+
+    while record_index < records.len() {
+        let mut slices = Vec::with_capacity(records.len() - record_index);
+        slices.push(IoSlice::new(
+            &records[record_index].payload[record_offset..],
+        ));
+        slices.extend(
+            records[record_index + 1..]
+                .iter()
+                .map(|record| IoSlice::new(&record.payload)),
+        );
+
+        let written = file.write_vectored(&slices).await?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "failed to write filesystem bulk batch",
+            ));
+        }
+
+        let mut remaining = written;
+        while record_index < records.len() {
+            let record_remaining = records[record_index].payload.len() - record_offset;
+            if remaining < record_remaining {
+                record_offset += remaining;
+                break;
+            }
+            remaining -= record_remaining;
+            record_index += 1;
+            record_offset = 0;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Handles the exact end marker for a generation-8 filesystem write.
+pub async fn handle_fs_bulk_finish(
+    id: u32,
+    finish: BulkFinish,
+    session: &mut FsWriteSession,
+    out_buf: &mut Vec<u8>,
+) -> Result<bool, String> {
+    let Some(receiver) = session.bulk.as_mut() else {
+        return Err("bulk finish sent to a generation-6 filesystem write".into());
+    };
+    receiver
+        .accept_finish(finish)
+        .map_err(|error| format!("invalid filesystem bulk finish: {error}"))?;
+
+    if let Some(expected) = session.expected_len
+        && session.written != expected
+    {
+        encode_response(
+            id,
+            error_response(format!(
+                "write length mismatch: expected {expected}, wrote {}",
+                session.written
+            )),
+            out_buf,
+        )?;
+        return Ok(true);
+    }
+
+    let mut file = session.file.lock().await;
+    if let Err(error) = file.flush().await {
+        encode_response(id, error_response(format!("flush: {error}")), out_buf)?;
+        return Ok(true);
+    }
+    encode_response(id, ok_response(None), out_buf)?;
+    Ok(true)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Handlers
+//--------------------------------------------------------------------------------------------------
+
+async fn handle_realpath(path: &str) -> FsResponse {
+    match realpath(path).await {
+        Ok(path) => ok_response(Some(FsResponseData::Path(path))),
+        Err(e) => error_response(format!("realpath: {e}")),
+    }
+}
+
+async fn handle_stat(path: &str, follow_symlink: bool) -> FsResponse {
+    let result = if follow_symlink {
+        tokio::fs::metadata(path).await
+    } else {
+        tokio::fs::symlink_metadata(path).await
+    };
+
+    match result {
+        Ok(meta) => ok_response(Some(FsResponseData::Stat(metadata_to_entry_info(
+            path, &meta,
+        )))),
+        Err(e) => error_response(format!("stat: {e}")),
+    }
+}
+
+async fn handle_setstat(path: &str, follow_symlink: bool, attrs: FsSetAttrs) -> FsResponse {
+    match apply_path_attrs(path, follow_symlink, attrs).await {
+        Ok(()) => ok_response(None),
+        Err(e) => error_response(format!("setstat: {e}")),
+    }
+}
+
+async fn handle_list(path: &str) -> FsResponse {
+    match read_all_dir(path).await {
+        Ok(entries) => ok_response(Some(FsResponseData::List(entries))),
+        Err(e) => error_response(format!("readdir: {e}")),
+    }
+}
+
+async fn handle_readlink(path: &str) -> FsResponse {
+    match tokio::fs::read_link(path).await {
+        Ok(target) => ok_response(Some(FsResponseData::Path(
+            target.to_string_lossy().to_string(),
+        ))),
+        Err(e) => error_response(format!("readlink: {e}")),
+    }
+}
+
+async fn handle_symlink(target: &str, link_path: &str, user: Option<String>) -> FsResponse {
+    let target = target.to_string();
+    let link_path = link_path.to_string();
+    match run_as_user(user, move || std::os::unix::fs::symlink(target, link_path)).await {
+        Ok(Ok(())) => ok_response(None),
+        Ok(Err(e)) => error_response(format!("symlink: {e}")),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_open_file(
+    id: u32,
+    state: &mut FsState,
+    path: &str,
+    options: FsOpenOptions,
+) -> FsResponse {
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options
+        .read(options.read)
+        .write(options.write)
+        .append(options.append)
+        .create(options.create)
+        .truncate(options.truncate)
+        .create_new(options.create_new);
+    if let Some(mode) = options.mode {
+        open_options.mode(mode);
+    }
+
+    let open_path = path.to_string();
+    match run_as_user(options.user, move || open_options.open(open_path)).await {
+        Ok(Ok(file)) => match state.insert_file(
+            id,
+            tokio::fs::File::from_std(file),
+            options.read,
+            options.write,
+            options.append,
+            path.to_string(),
+        ) {
+            Ok(handle) => ok_response(Some(FsResponseData::Handle(handle))),
+            Err(e) => error_response(format!("open: {e}")),
+        },
+        Ok(Err(e)) => error_response(format!("open: {e}")),
+        Err(e) => error_response(e),
+    }
+}
+
+async fn handle_open_dir(id: u32, state: &mut FsState, path: &str) -> FsResponse {
+    match tokio::fs::read_dir(path).await {
+        Ok(dir) => match state.insert_dir(id, dir, path.to_string()) {
+            Ok(handle) => ok_response(Some(FsResponseData::Handle(handle))),
+            Err(e) => error_response(format!("opendir: {e}")),
+        },
+        Err(e) => error_response(format!("opendir: {e}")),
+    }
+}
+
+async fn handle_close_handle(id: u32, state: &mut FsState, handle: u64) -> FsResponse {
+    match state.close_handle(id, handle) {
+        Ok(FsHandleEntry::File { file, .. }) => {
+            let mut file = file.lock().await;
+            match file.flush().await {
+                Ok(()) => ok_response(None),
+                Err(e) => error_response(format!("close: {e}")),
+            }
+        }
+        Ok(FsHandleEntry::Dir { .. }) => ok_response(None),
+        Err(e) => error_response(format!("close: {e}")),
+    }
+}
+
+async fn handle_read_dir(id: u32, state: &FsState, handle: u64, limit: Option<u32>) -> FsResponse {
+    let (dir, path) = match state.dir(id, handle) {
+        Ok(v) => v,
+        Err(e) => return error_response(format!("readdir: {e}")),
+    };
+
+    let limit = limit.unwrap_or(DEFAULT_READ_DIR_LIMIT).max(1);
+    let mut dir = dir.lock().await;
+    let mut entries = Vec::new();
+
+    for _ in 0..limit {
+        match dir.next_entry().await {
+            Ok(Some(entry)) => {
+                let entry_path = entry.path();
+                let path_str = entry_path.to_string_lossy().to_string();
+                match tokio::fs::symlink_metadata(&entry_path).await {
+                    Ok(meta) => entries.push(metadata_to_entry_info(&path_str, &meta)),
+                    Err(_) => entries.push(unknown_entry_info(&path_str)),
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return error_response(format!("readdir {path}: {e}")),
+        }
+    }
+
+    ok_response(Some(FsResponseData::List(entries)))
+}
+
+async fn handle_fstat(id: u32, state: &FsState, handle: u64) -> FsResponse {
+    match state.handles.get(&handle) {
+        Some(FsHandleEntry::File { file, path, .. }) => {
+            if let Err(e) = state
+                .handles
+                .get(&handle)
+                .expect("entry just matched")
+                .ensure_owner(handle, id)
+            {
+                return error_response(format!("fstat: {e}"));
+            }
+            let file = file.lock().await;
+            match file.metadata().await {
+                Ok(meta) => ok_response(Some(FsResponseData::Stat(metadata_to_entry_info(
+                    path, &meta,
+                )))),
+                Err(e) => error_response(format!("fstat: {e}")),
+            }
+        }
+        Some(FsHandleEntry::Dir { path, .. }) => {
+            if let Err(e) = state
+                .handles
+                .get(&handle)
+                .expect("entry just matched")
+                .ensure_owner(handle, id)
+            {
+                return error_response(format!("fstat: {e}"));
+            }
+            match tokio::fs::metadata(path).await {
+                Ok(meta) => ok_response(Some(FsResponseData::Stat(metadata_to_entry_info(
+                    path, &meta,
+                )))),
+                Err(e) => error_response(format!("fstat: {e}")),
+            }
+        }
+        None => error_response(format!("fstat: invalid handle: {handle}")),
+    }
+}
+
+async fn handle_fsetstat(id: u32, state: &FsState, handle: u64, attrs: FsSetAttrs) -> FsResponse {
+    let (file, _, path) = match state.file(id, handle, false, false) {
+        Ok(v) => v,
+        Err(e) => return error_response(format!("fsetstat: {e}")),
+    };
+
+    let mut file = file.lock().await;
+    match apply_file_attrs(&mut file, &path, attrs).await {
+        Ok(()) => ok_response(None),
+        Err(e) => error_response(format!("fsetstat: {e}")),
+    }
+}
+
+async fn handle_mkdir(path: &str, mode: Option<u32>, user: Option<String>) -> FsResponse {
+    let path = path.to_string();
+    match run_as_user(user, move || {
+        std::fs::create_dir_all(&path).map_err(|e| format!("mkdir: {e}"))?;
+        if let Some(mode) = mode {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .map_err(|e| format!("chmod: {e}"))?;
+        }
+        Ok(())
+    })
+    .await
+    {
+        Ok(Ok(())) => ok_response(None),
+        Ok(Err(e)) => error_response(e),
+        Err(e) => error_response(e),
+    }
+}
+
+/// Runs a blocking filesystem call with the filesystem identity of `user`.
+///
+/// The identity is thread-local (`setfsuid`/`setfsgid` and the raw `setgroups` syscall), so it never
+/// leaks into other requests or exec sessions, and the kernel enforces the user's permissions and
+/// assigns ownership of anything the call creates. `None` runs the call unchanged, as root.
+async fn run_as_user<T, F>(user: Option<String>, f: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let Some(user) = user else {
+        return tokio::task::spawn_blocking(f)
+            .await
+            .map_err(|e| format!("filesystem task: {e}"));
+    };
+    let (uid, gid, groups) =
+        crate::session::resolve_user_groups(&user).map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        let _identity =
+            FsIdentity::switch(uid, gid, &groups).map_err(|e| format!("switch to {user}: {e}"))?;
+        Ok(f())
+    })
+    .await
+    .map_err(|e| format!("filesystem task: {e}"))?
+}
+
+/// Restores the thread's filesystem identity on drop, including when the call panics.
+struct FsIdentity {
+    uid: libc::c_int,
+    gid: libc::c_int,
+    groups: Vec<libc::gid_t>,
+}
+
+impl FsIdentity {
+    fn switch(uid: u32, gid: u32, groups: &[libc::gid_t]) -> std::io::Result<Self> {
+        let previous = current_groups()?;
+        set_groups(groups)?;
+        // Each call returns the previous id even when it fails, so a second call confirms the change.
+        let identity = unsafe {
+            Self {
+                gid: libc::setfsgid(gid),
+                uid: libc::setfsuid(uid),
+                groups: previous,
+            }
+        };
+        if unsafe { libc::setfsuid(uid) } != uid as libc::c_int
+            || unsafe { libc::setfsgid(gid) } != gid as libc::c_int
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        Ok(identity)
+    }
+}
+
+impl Drop for FsIdentity {
+    fn drop(&mut self) {
+        unsafe {
+            libc::setfsuid(self.uid as libc::uid_t);
+            libc::setfsgid(self.gid as libc::gid_t);
+        }
+        let _ = set_groups(&self.groups);
+    }
+}
+
+fn current_groups() -> std::io::Result<Vec<libc::gid_t>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    let mut groups = vec![0; count.max(0) as usize];
+    let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    groups.truncate(count as usize);
+    Ok(groups)
+}
+
+/// Sets the calling thread's supplementary groups. `libc::setgroups` would change every thread in
+/// the process, including concurrent root requests, so this calls the syscall directly.
+fn set_groups(groups: &[libc::gid_t]) -> std::io::Result<()> {
+    if unsafe { libc::syscall(libc::SYS_setgroups, groups.len(), groups.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+async fn handle_remove(path: &str) -> FsResponse {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => ok_response(None),
+        Err(e) => error_response(format!("remove: {e}")),
+    }
+}
+
+async fn handle_remove_dir(path: &str, recursive: bool) -> FsResponse {
+    let result = if recursive {
+        tokio::fs::remove_dir_all(path).await
+    } else {
+        tokio::fs::remove_dir(path).await
+    };
+    match result {
+        Ok(()) => ok_response(None),
+        Err(e) => error_response(format!("remove_dir: {e}")),
+    }
+}
+
+async fn handle_copy(src: &str, dst: &str) -> FsResponse {
+    match tokio::fs::copy(src, dst).await {
+        Ok(_) => ok_response(None),
+        Err(e) => error_response(format!("copy: {e}")),
+    }
+}
+
+async fn handle_rename(src: &str, dst: &str) -> FsResponse {
+    match tokio::fs::rename(src, dst).await {
+        Ok(()) => ok_response(None),
+        Err(e) => error_response(format!("rename: {e}")),
+    }
+}
+
+fn accept_fs_read_offer(offer: BulkOffer) -> Result<BulkAccepted, String> {
+    let offer = offer
+        .validate()
+        .map_err(|error| format!("invalid filesystem read bulk offer: {error}"))?;
+    if offer.guest_to_host_credit_limit == 0 {
+        return Err("filesystem read bulk offer must grant guest-to-host credit".into());
+    }
+    Ok(BulkAccepted {
+        kind: BulkKind::Filesystem,
+        flows: BULK_FLOW_MASK_GUEST_TO_HOST,
+        format: offer.format,
+        max_record_payload: offer
+            .max_record_payload
+            .min(DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD),
+        host_to_guest_credit_limit: 0,
+        guest_to_host_credit_limit: offer.guest_to_host_credit_limit,
+    })
+}
+
+fn accept_fs_write_offer(offer: BulkOffer) -> Result<BulkAccepted, String> {
+    let offer = offer
+        .validate()
+        .map_err(|error| format!("invalid filesystem write bulk offer: {error}"))?;
+    if offer.guest_to_host_credit_limit != 0 {
+        return Err("filesystem write bulk offer must not grant guest-to-host credit".into());
+    }
+    Ok(BulkAccepted {
+        kind: BulkKind::Filesystem,
+        flows: BULK_FLOW_MASK_HOST_TO_GUEST,
+        format: offer.format,
+        max_record_payload: offer
+            .max_record_payload
+            .min(DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD),
+        host_to_guest_credit_limit: DEFAULT_BULK_WINDOW,
+        guest_to_host_credit_limit: 0,
+    })
+}
+
+async fn handle_bulk_read_stream(
+    id: u32,
+    file: Arc<Mutex<tokio::fs::File>>,
+    offset: u64,
+    len: Option<u64>,
+    mut sender: BulkSendState,
+    mut credit_rx: watch::Receiver<Option<BulkCredit>>,
+    tx: &SessionOutputSender,
+) {
+    let mut file = file.lock().await;
+    if let Err(error) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        send_raw_response(id, false, Some(format!("seek: {error}")), None, tx).await;
+        return;
+    }
+
+    let mut remaining = len;
+    loop {
+        if remaining == Some(0) {
+            break;
+        }
+        while sender.available_credit() == 0 {
+            if credit_rx.changed().await.is_err() {
+                return;
+            }
+            let Some(credit) = *credit_rx.borrow_and_update() else {
+                continue;
+            };
+            if let Err(error) = sender.apply_credit(credit) {
+                send_raw_response(
+                    id,
+                    false,
+                    Some(format!("invalid filesystem bulk credit: {error}")),
+                    None,
+                    tx,
+                )
+                .await;
+                return;
+            }
+        }
+
+        let read_len = sender
+            .available_credit()
+            .min(sender.max_record_payload() as u64)
+            .min(remaining.unwrap_or(u64::MAX)) as usize;
+        let Some(permit) = tx.reserve_bulk(read_len).await else {
+            return;
+        };
+        let mut payload = vec![0u8; read_len];
+        match file.read(&mut payload).await {
+            Ok(0) => break,
+            Ok(read) => {
+                payload.truncate(read);
+                if let Some(remaining) = &mut remaining {
+                    *remaining = remaining.saturating_sub(read as u64);
+                }
+                let record_offset = match sender.admit(read) {
+                    Ok(offset) => offset,
+                    Err(error) => {
+                        send_raw_response(
+                            id,
+                            false,
+                            Some(format!("admit filesystem bulk record: {error}")),
+                            None,
+                            tx,
+                        )
+                        .await;
+                        return;
+                    }
+                };
+                let record = BulkRecord {
+                    id,
+                    kind: BulkKind::Filesystem,
+                    flow: BulkFlow::GuestToHost,
+                    offset: record_offset,
+                    payload: Bytes::from(payload),
+                };
+                let output = BulkSessionOutput::new(record, RawActivity::fs_bytes(read));
+                if !tx
+                    .send_reserved(id, SessionOutput::Bulk(output), permit)
+                    .await
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                send_raw_response(id, false, Some(format!("read: {error}")), None, tx).await;
+                return;
+            }
+        }
+    }
+
+    let finish = match sender.finish() {
+        Ok(finish) => finish,
+        Err(error) => {
+            send_raw_response(
+                id,
+                false,
+                Some(format!("finish filesystem bulk read: {error}")),
+                None,
+                tx,
+            )
+            .await;
+            return;
+        }
+    };
+    if !send_raw_control(id, MessageType::BulkFinish, &finish, None, tx).await {
+        return;
+    }
+    send_raw_response(id, true, None, None, tx).await;
+}
+
+async fn handle_read_stream(
+    id: u32,
+    file: Arc<Mutex<tokio::fs::File>>,
+    offset: u64,
+    len: Option<u64>,
+    tx: &SessionOutputSender,
+) {
+    let mut file = file.lock().await;
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(offset)).await {
+        send_raw_response(id, false, Some(format!("seek: {e}")), None, tx).await;
+        return;
+    }
+
+    let mut remaining = len;
+    let mut chunk = vec![0u8; FS_CHUNK_SIZE];
+    let mut buf = Vec::new();
+
+    loop {
+        // Reserve before the file read and CBOR materialization so concurrent streams cannot
+        // each create an uncharged maximum-sized frame while aggregate output is saturated.
+        let Some(permit) = tx.reserve(codec::MAX_FRAME_SIZE as usize + 4).await else {
+            return;
+        };
+        let read_len = match remaining {
+            Some(0) => break,
+            Some(n) => chunk.len().min(n as usize),
+            None => chunk.len(),
+        };
+
+        match file.read(&mut chunk[..read_len]).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(ref mut remaining) = remaining {
+                    *remaining = remaining.saturating_sub(n as u64);
+                }
+                let data = FsData {
+                    data: chunk[..n].to_vec(),
+                };
+                let msg = match Message::with_payload(MessageType::FsData, id, &data) {
+                    Ok(msg) => msg,
+                    Err(e) => {
+                        send_raw_response(id, false, Some(format!("encode chunk: {e}")), None, tx)
+                            .await;
+                        return;
+                    }
+                };
+                buf.clear();
+                if let Err(e) = codec::encode_to_buf(&msg, &mut buf) {
+                    send_raw_response(
+                        id,
+                        false,
+                        Some(format!("encode chunk frame: {e}")),
+                        None,
+                        tx,
+                    )
+                    .await;
+                    return;
+                }
+                let output =
+                    RawSessionOutput::new(std::mem::take(&mut buf), RawActivity::fs_bytes(n), None);
+                if !tx
+                    .send_reserved(id, SessionOutput::Raw(output), permit)
+                    .await
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                send_raw_response(id, false, Some(format!("read: {e}")), None, tx).await;
+                return;
+            }
+        }
+    }
+
+    send_raw_response(id, true, None, None, tx).await;
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Attribute Helpers
+//--------------------------------------------------------------------------------------------------
+
+async fn apply_path_attrs(
+    path: &str,
+    follow_symlink: bool,
+    attrs: FsSetAttrs,
+) -> Result<(), String> {
+    if let Some(size) = attrs.size {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .await
+            .map_err(|e| format!("open for truncate: {e}"))?;
+        file.set_len(size)
+            .await
+            .map_err(|e| format!("set_len: {e}"))?;
+    }
+
+    if let Some(mode) = attrs.mode {
+        if !follow_symlink
+            && tokio::fs::symlink_metadata(path)
+                .await
+                .map_err(|e| format!("lstat before chmod: {e}"))?
+                .file_type()
+                .is_symlink()
+        {
+            return Err("chmod on symlink without following is not supported".into());
+        }
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|e| format!("chmod: {e}"))?;
+    }
+
+    if attrs.uid.is_some() || attrs.gid.is_some() {
+        chown_path(path, follow_symlink, attrs.uid, attrs.gid)?;
+    }
+
+    if attrs.atime.is_some() || attrs.mtime.is_some() {
+        set_times_path(path, follow_symlink, attrs.atime, attrs.mtime).await?;
+    }
+
+    Ok(())
+}
+
+async fn apply_file_attrs(
+    file: &mut tokio::fs::File,
+    path: &str,
+    attrs: FsSetAttrs,
+) -> Result<(), String> {
+    if let Some(size) = attrs.size {
+        file.set_len(size)
+            .await
+            .map_err(|e| format!("set_len: {e}"))?;
+    }
+
+    if let Some(mode) = attrs.mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(|e| format!("chmod: {e}"))?;
+    }
+
+    if attrs.uid.is_some() || attrs.gid.is_some() {
+        let uid = attrs.uid.map(|v| v as libc::uid_t).unwrap_or(!0);
+        let gid = attrs.gid.map(|v| v as libc::gid_t).unwrap_or(!0);
+        let rc = unsafe { libc::fchown(file.as_raw_fd(), uid, gid) };
+        if rc != 0 {
+            return Err(format!("fchown: {}", std::io::Error::last_os_error()));
+        }
+    }
+
+    if attrs.atime.is_some() || attrs.mtime.is_some() {
+        set_times_fd(file.as_raw_fd(), path, attrs.atime, attrs.mtime).await?;
+    }
+
+    Ok(())
+}
+
+fn chown_path(
+    path: &str,
+    follow_symlink: bool,
+    uid: Option<u32>,
+    gid: Option<u32>,
+) -> Result<(), String> {
+    let c_path = cstring_path(path)?;
+    let uid = uid.map(|v| v as libc::uid_t).unwrap_or(!0);
+    let gid = gid.map(|v| v as libc::gid_t).unwrap_or(!0);
+    let rc = unsafe {
+        if follow_symlink {
+            libc::chown(c_path.as_ptr(), uid, gid)
+        } else {
+            libc::lchown(c_path.as_ptr(), uid, gid)
+        }
+    };
+    if rc != 0 {
+        return Err(format!("chown: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+async fn set_times_path(
+    path: &str,
+    follow_symlink: bool,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+) -> Result<(), String> {
+    let meta = if follow_symlink {
+        tokio::fs::metadata(path).await
+    } else {
+        tokio::fs::symlink_metadata(path).await
+    }
+    .map_err(|e| format!("stat before utimensat: {e}"))?;
+    let times = timespecs(atime.unwrap_or(meta.atime()), mtime.unwrap_or(meta.mtime()));
+    let c_path = cstring_path(path)?;
+    let flags = if follow_symlink {
+        0
+    } else {
+        libc::AT_SYMLINK_NOFOLLOW
+    };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), flags) };
+    if rc != 0 {
+        return Err(format!("utimensat: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+async fn set_times_fd(
+    fd: std::os::fd::RawFd,
+    path: &str,
+    atime: Option<i64>,
+    mtime: Option<i64>,
+) -> Result<(), String> {
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("stat before futimens: {e}"))?;
+    let times = timespecs(atime.unwrap_or(meta.atime()), mtime.unwrap_or(meta.mtime()));
+    let rc = unsafe { libc::futimens(fd, times.as_ptr()) };
+    if rc != 0 {
+        return Err(format!("futimens: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+fn timespecs(atime: i64, mtime: i64) -> [libc::timespec; 2] {
+    [
+        libc::timespec {
+            tv_sec: atime as _,
+            tv_nsec: 0,
+        },
+        libc::timespec {
+            tv_sec: mtime as _,
+            tv_nsec: 0,
+        },
+    ]
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions: Helpers
+//--------------------------------------------------------------------------------------------------
+
+fn encode_response(id: u32, resp: FsResponse, out_buf: &mut Vec<u8>) -> Result<(), String> {
+    let msg = Message::with_payload(MessageType::FsResponse, id, &resp)
+        .map_err(|e| format!("encode fs response: {e}"))?;
+    codec::encode_to_buf(&msg, out_buf).map_err(|e| format!("encode fs response frame: {e}"))?;
+    Ok(())
+}
+
+fn encode_control<T: Serialize>(
+    message_type: MessageType,
+    id: u32,
+    payload: &T,
+    out_buf: &mut Vec<u8>,
+) -> Result<(), String> {
+    let message = Message::with_payload(message_type, id, payload)
+        .map_err(|error| format!("encode {}: {error}", message_type.as_str()))?;
+    codec::encode_to_buf(&message, out_buf)
+        .map_err(|error| format!("encode {} frame: {error}", message_type.as_str()))
+}
+
+async fn send_raw_control<T: Serialize>(
+    id: u32,
+    message_type: MessageType,
+    payload: &T,
+    completion: Option<RawSessionCompletion>,
+    tx: &SessionOutputSender,
+) -> bool {
+    let mut frame = Vec::new();
+    if let Err(error) = encode_control(message_type, id, payload, &mut frame) {
+        eprintln!("failed to {error}");
+        return false;
+    }
+    tx.send(
+        id,
+        SessionOutput::Raw(RawSessionOutput::new(
+            frame,
+            RawActivity::guest_message(),
+            completion,
+        )),
+    )
+    .await
+}
+
+async fn send_raw_response(
+    id: u32,
+    ok: bool,
+    error: Option<String>,
+    data: Option<FsResponseData>,
+    tx: &SessionOutputSender,
+) {
+    let resp = FsResponse { ok, error, data };
+    match Message::with_payload(MessageType::FsResponse, id, &resp) {
+        Ok(msg) => {
+            let mut buf = Vec::new();
+            match codec::encode_to_buf(&msg, &mut buf) {
+                Ok(()) => {
+                    let output = RawSessionOutput::new(
+                        buf,
+                        RawActivity::guest_message(),
+                        Some(RawSessionCompletion::FsRead),
+                    );
+                    let _ = tx.send(id, SessionOutput::Raw(output)).await;
+                }
+                Err(e) => {
+                    eprintln!("failed to encode fs response frame for {id}: {e}");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("failed to encode fs response for {id}: {e}");
+        }
+    }
+}
+
+async fn realpath(path: &str) -> Result<String, String> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(path) => Ok(path.to_string_lossy().to_string()),
+        Err(original_error) => {
+            let path = Path::new(path);
+            let Some(parent) = path.parent() else {
+                return Err(original_error.to_string());
+            };
+            let parent = tokio::fs::canonicalize(parent)
+                .await
+                .map_err(|_| original_error.to_string())?;
+            let resolved = match path.file_name() {
+                Some(name) => parent.join(name),
+                None => parent,
+            };
+            Ok(resolved.to_string_lossy().to_string())
+        }
+    }
+}
+
+async fn read_all_dir(path: &str) -> Result<Vec<FsEntryInfo>, String> {
+    let mut dir = tokio::fs::read_dir(path)
+        .await
+        .map_err(|e| format!("opendir: {e}"))?;
+    let mut entries = Vec::new();
+
+    loop {
+        match dir.next_entry().await {
+            Ok(Some(entry)) => {
+                let entry_path = entry.path();
+                let path_str = entry_path.to_string_lossy().to_string();
+                match tokio::fs::symlink_metadata(&entry_path).await {
+                    Ok(meta) => entries.push(metadata_to_entry_info(&path_str, &meta)),
+                    Err(_) => entries.push(unknown_entry_info(&path_str)),
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+
+    Ok(entries)
+}
+
+fn ok_response(data: Option<FsResponseData>) -> FsResponse {
+    FsResponse {
+        ok: true,
+        error: None,
+        data,
+    }
+}
+
+fn error_response(error: String) -> FsResponse {
+    FsResponse {
+        ok: false,
+        error: Some(error),
+        data: None,
+    }
+}
+
+fn metadata_to_entry_info(path: &str, meta: &std::fs::Metadata) -> FsEntryInfo {
+    let kind = if meta.is_file() {
+        "file"
+    } else if meta.is_dir() {
+        "dir"
+    } else if meta.is_symlink() {
+        "symlink"
+    } else {
+        "other"
+    };
+
+    let mtime = Some(meta.mtime());
+    let atime = Some(meta.atime());
+
+    FsEntryInfo {
+        path: path.to_string(),
+        kind: kind.to_string(),
+        size: meta.len(),
+        mode: meta.mode(),
+        modified: mtime,
+        uid: meta.uid(),
+        gid: meta.gid(),
+        atime,
+        mtime,
+    }
+}
+
+fn unknown_entry_info(path: &str) -> FsEntryInfo {
+    FsEntryInfo {
+        path: path.to_string(),
+        kind: "other".to_string(),
+        size: 0,
+        mode: 0,
+        modified: None,
+        uid: 0,
+        gid: 0,
+        atime: None,
+        mtime: None,
+    }
+}
+
+fn cstring_path(path: impl AsRef<Path>) -> Result<CString, String> {
+    CString::new(path.as_ref().as_os_str().as_bytes())
+        .map_err(|e| format!("path contains NUL: {e}"))
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn filesystem_offer_preserves_an_older_hosts_smaller_record_limit() {
+        assert_eq!(
+            DEFAULT_FILESYSTEM_BULK_RECORD_PAYLOAD as usize,
+            FS_CHUNK_SIZE
+        );
+        let old_offer = BulkOffer {
+            max_record_payload: microsandbox_protocol::bulk::DEFAULT_BULK_RECORD_PAYLOAD,
+            ..BulkOffer::filesystem_write()
+        };
+
+        let accepted = accept_fs_write_offer(old_offer).unwrap();
+        assert_eq!(
+            accepted.max_record_payload,
+            microsandbox_protocol::bulk::DEFAULT_BULK_RECORD_PAYLOAD
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_bulk_write_requires_exact_offsets_and_finish_length() {
+        let path = test_path("bulk-write");
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut session = FsWriteSession {
+            owner_id: 1,
+            handle: 1,
+            file: Arc::new(Mutex::new(file)),
+            offset: 0,
+            append: false,
+            expected_len: Some(7),
+            written: 0,
+            bulk: Some(
+                BulkReceiveState::new(
+                    BulkKind::Filesystem,
+                    BulkFlow::HostToGuest,
+                    microsandbox_protocol::bulk::DEFAULT_BULK_RECORD_PAYLOAD,
+                    DEFAULT_BULK_WINDOW,
+                    DEFAULT_BULK_WINDOW,
+                )
+                .unwrap(),
+            ),
+        };
+        let mut out = Vec::new();
+
+        let wrong_offset = BulkRecord {
+            id: 1,
+            kind: BulkKind::Filesystem,
+            flow: BulkFlow::HostToGuest,
+            offset: 1,
+            payload: Bytes::from_static(b"ignored"),
+        };
+        assert!(
+            handle_fs_bulk_record(1, &wrong_offset, &mut session, &mut out)
+                .await
+                .unwrap_err()
+                .contains("does not match expected")
+        );
+
+        let first = BulkRecord {
+            offset: 0,
+            payload: Bytes::from_static(b"ign"),
+            ..wrong_offset
+        };
+        let second = BulkRecord {
+            offset: 3,
+            payload: Bytes::from_static(b"ored"),
+            ..first.clone()
+        };
+        assert!(
+            !handle_fs_bulk_records(1, &[first, second], &mut session, &mut out)
+                .await
+                .unwrap()
+        );
+        assert!(
+            handle_fs_bulk_finish(
+                1,
+                BulkFinish {
+                    kind: BulkKind::Filesystem,
+                    flow: BulkFlow::HostToGuest,
+                    final_offset: 7,
+                },
+                &mut session,
+                &mut out,
+            )
+            .await
+            .unwrap()
+        );
+        drop(session);
+
+        let response = codec::try_decode_from_buf(&mut out).unwrap().unwrap();
+        assert_eq!(response.t, MessageType::FsResponse);
+        assert!(response.payload::<FsResponse>().unwrap().ok);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"ignored");
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_bulk_read_emits_payload_exact_finish_then_terminal_response() {
+        let path = test_path("bulk-read");
+        tokio::fs::write(&path, b"raw-read-payload").await.unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let sender = BulkSendState::new(
+            BulkKind::Filesystem,
+            BulkFlow::GuestToHost,
+            microsandbox_protocol::bulk::DEFAULT_BULK_RECORD_PAYLOAD,
+            DEFAULT_BULK_WINDOW,
+        )
+        .unwrap();
+        let (_credit_tx, credit_rx) = watch::channel(None);
+        let (session_tx, mut session_rx) = SessionOutputSender::channel();
+
+        handle_bulk_read_stream(
+            2,
+            Arc::new(Mutex::new(file)),
+            0,
+            None,
+            sender,
+            credit_rx,
+            &session_tx,
+        )
+        .await;
+
+        let first = session_rx.recv().await.unwrap();
+        let SessionOutput::Bulk(first) = first.output else {
+            panic!("expected raw filesystem record");
+        };
+        assert_eq!(first.record.offset, 0);
+        assert_eq!(
+            first.record.payload,
+            Bytes::from_static(b"raw-read-payload")
+        );
+
+        let finish = decode_raw_output(session_rx.recv().await.unwrap().output);
+        assert_eq!(finish.t, MessageType::BulkFinish);
+        let finish: BulkFinish = finish.payload().unwrap();
+        assert_eq!(finish.final_offset, b"raw-read-payload".len() as u64);
+        let response = decode_raw_output(session_rx.recv().await.unwrap().output);
+        assert_eq!(response.t, MessageType::FsResponse);
+        assert!(response.payload::<FsResponse>().unwrap().ok);
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn requested_user_owns_created_entries_and_is_bound_by_permissions() {
+        // Switching the filesystem identity needs root.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let user = Some("nobody".to_string());
+        let nobody = crate::session::resolve_default_user(user.as_deref()).unwrap();
+        let owner = |path: &std::path::Path| {
+            let meta = std::fs::symlink_metadata(path).unwrap();
+            (meta.uid(), meta.gid())
+        };
+        let dir = test_path("as-user");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut state = FsState::default();
+        let open = |user: Option<String>| FsOpenOptions {
+            write: true,
+            create: true,
+            user,
+            ..Default::default()
+        };
+
+        let file = dir.join("file");
+        let resp =
+            handle_open_file(1, &mut state, file.to_str().unwrap(), open(user.clone())).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(owner(&file), nobody);
+
+        let nested = dir.join("a/b");
+        let resp = handle_mkdir(nested.to_str().unwrap(), Some(0o755), user.clone()).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(owner(&dir.join("a")), nobody);
+        assert_eq!(owner(&nested), nobody);
+
+        let link = dir.join("link");
+        let resp = handle_symlink("file", link.to_str().unwrap(), user.clone()).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(owner(&link), nobody);
+
+        // Entries created without a user stay root-owned, and the user cannot open them.
+        let root_file = dir.join("root-file");
+        let resp = handle_open_file(2, &mut state, root_file.to_str().unwrap(), open(None)).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        std::fs::set_permissions(&root_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(owner(&root_file), (0, 0));
+        let resp = handle_open_file(
+            3,
+            &mut state,
+            root_file.to_str().unwrap(),
+            open(user.clone()),
+        )
+        .await;
+        assert!(!resp.ok);
+
+        // The identity is confined to the request.
+        let after = dir.join("after");
+        let resp = handle_open_file(4, &mut state, after.to_str().unwrap(), open(None)).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(owner(&after), (0, 0));
+
+        // The rest edits /etc/group, so it runs only where the caller opted in (a throwaway container).
+        if std::env::var_os("MSB_TEST_EDIT_ETC_GROUP").is_none() {
+            std::fs::remove_dir_all(dir).unwrap();
+            return;
+        }
+        // A directory writable only through a supplementary group of the user.
+        struct RestoreGroupFile(Vec<u8>);
+        impl Drop for RestoreGroupFile {
+            fn drop(&mut self) {
+                std::fs::write("/etc/group", &self.0).unwrap();
+            }
+        }
+        let group_gid = 54321;
+        let original = std::fs::read("/etc/group").unwrap();
+        let _restore = RestoreGroupFile(original.clone());
+        let mut entries = original;
+        entries.extend_from_slice(format!("msb-shared:x:{group_gid}:nobody\n").as_bytes());
+        std::fs::write("/etc/group", entries).unwrap();
+        let shared = dir.join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::os::unix::fs::chown(&shared, None, Some(group_gid)).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o770)).unwrap();
+        let root_groups = current_groups().unwrap();
+        let in_shared = shared.join("file");
+        let resp = handle_open_file(
+            5,
+            &mut state,
+            in_shared.to_str().unwrap(),
+            open(user.clone()),
+        )
+        .await;
+        assert!(resp.ok, "{:?}", resp.error);
+        assert_eq!(owner(&in_shared), nobody);
+        let resp = handle_mkdir(shared.join("sub").to_str().unwrap(), None, user.clone()).await;
+        assert!(resp.ok, "{:?}", resp.error);
+        // Only the calling thread takes the user's groups: a concurrent thread keeps root's.
+        let (ping, pinged) = std::sync::mpsc::channel::<()>();
+        let (pong, ponged) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while pinged.recv().is_ok() {
+                pong.send(current_groups().unwrap()).unwrap();
+            }
+        });
+        let concurrent = run_as_user(user.clone(), move || {
+            ping.send(()).unwrap();
+            ponged.recv().unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(concurrent, root_groups);
+        // The user's groups do not outlive the call, on this thread or on reused blocking threads.
+        assert_eq!(current_groups().unwrap(), root_groups);
+        let checks: Vec<_> = (0..64)
+            .map(|_| tokio::task::spawn_blocking(|| current_groups().unwrap()))
+            .collect();
+        for check in checks {
+            assert_eq!(check.await.unwrap(), root_groups);
+        }
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn decode_raw_output(output: SessionOutput) -> Message {
+        let SessionOutput::Raw(mut output) = output else {
+            panic!("expected raw control frame");
+        };
+        codec::try_decode_from_buf(&mut output.frame)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("msb-agentd-{name}-{}-{unique}", std::process::id()))
+    }
+}

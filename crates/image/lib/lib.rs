@@ -1,0 +1,58 @@
+//! OCI image pulling, EROFS materialization, and caching for microsandbox.
+//!
+//! This crate implements the OCI image lifecycle:
+//! - Registry communication (pull, auth, platform resolution)
+//! - Layer caching with content-addressable dedup
+//! - Tar ingestion into in-memory file trees
+//! - EROFS filesystem image generation (per-layer and flat modes)
+//! - ext4 upper disk formatting for writable overlay upper layer
+//! - Minimal EROFS reader for Append patches
+
+// New lints introduced in rustc 1.95 fire on existing code; cleanup
+// tracked separately.
+#![allow(
+    clippy::identity_op,
+    clippy::useless_conversion,
+    clippy::needless_update
+)]
+
+mod archive;
+mod cache;
+pub mod checkpoint;
+mod config;
+pub(crate) mod crc32c;
+mod digest;
+pub mod erofs;
+mod error;
+pub mod ext4;
+mod flat;
+pub(crate) mod layer;
+pub(crate) mod path_bytes;
+mod platform;
+mod progress;
+mod pull;
+mod registry;
+pub mod snapshot;
+pub(crate) mod stitch;
+pub mod tar;
+pub mod tree;
+
+//--------------------------------------------------------------------------------------------------
+// Re-Exports
+//--------------------------------------------------------------------------------------------------
+
+pub use archive::{
+    ImageArchiveFormat, ImageLoadOptions, ImageSaveConfig, ImageSaveLayer, ImageSaveRequest,
+    LoadedImage, load_archive, save_archive, save_docker_archive,
+};
+pub use cache::{CachedImageMetadata, CachedLayerMetadata, FlatRootfsRef, GlobalCache};
+pub use config::ImageConfig;
+pub use digest::Digest;
+pub use error::{ImageError, ImageResult};
+pub use flat::merge_erofs_layers;
+pub use microsandbox_types::RegistryAuth;
+pub use oci_client::Reference;
+pub use platform::{Arch, Os, Platform};
+pub use progress::{PullProgress, PullProgressHandle, PullProgressSender, progress_channel};
+pub use pull::{PullOptions, PullPolicy, PullResult, RootfsMaterialization};
+pub use registry::{Registry, RegistryBuilder};

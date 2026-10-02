@@ -1,0 +1,21 @@
+//! `microsandbox-cli` provides the `msb` CLI binary for managing microsandbox
+//! environments.
+
+#![warn(missing_docs)]
+
+//--------------------------------------------------------------------------------------------------
+// Exports
+//--------------------------------------------------------------------------------------------------
+
+pub mod boot_error_render;
+pub mod commands;
+pub mod exec_error_render;
+pub mod launch_compat;
+pub mod log_args;
+pub mod machine_cmd;
+#[cfg(feature = "net")]
+pub mod net_rule;
+pub mod sandbox_config;
+pub mod styles;
+pub mod tree;
+pub mod ui;
